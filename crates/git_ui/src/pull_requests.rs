@@ -1,6 +1,7 @@
 pub mod github_api;
 pub mod pr_overview;
 pub mod pr_review;
+pub mod pr_status;
 
 use editor::Editor;
 use gpui::{
@@ -15,6 +16,8 @@ use workspace::{ModalView, Workspace};
 
 use github_api::{GithubClient, GithubContext, GithubError};
 use pr_overview::{PullRequestOverviewView, show_toast};
+
+pub use pr_status::PullRequestStatusItem;
 
 actions!(
     pull_requests,
