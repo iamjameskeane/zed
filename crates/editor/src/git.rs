@@ -137,6 +137,22 @@ pub(super) struct InlineBlamePopover {
     pub(super) keyboard_grace: bool,
 }
 
+/// Takes over diff review comments for an editor. While set, the review overlay shows one
+/// button per label from [`DiffReviewHandler::button_labels`] and hands the comment to
+/// [`DiffReviewHandler::submit`] instead of storing it for the Agent panel.
+pub trait DiffReviewHandler {
+    fn button_labels(&self, cx: &App) -> Vec<SharedString>;
+
+    fn submit(&self, submission: DiffReviewSubmission, window: &mut Window, cx: &mut App);
+}
+
+pub struct DiffReviewSubmission {
+    pub editor: Entity<Editor>,
+    pub range: Range<Anchor>,
+    pub comment: String,
+    pub button_index: usize,
+}
+
 /// Represents a diff review button indicator that shows up when hovering over lines in the gutter
 /// in diff view mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -695,6 +711,10 @@ impl Editor {
     /// Stores the diff review comment locally.
     /// Comments are stored per-hunk and can later be batch-submitted to the Agent panel.
     pub fn submit_diff_review_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff_review_handler.is_some() {
+            self.submit_diff_review_to_handler(0, window, cx);
+            return;
+        }
         // Find the overlay that currently has focus
         let overlay_index = self
             .diff_review_overlays
@@ -725,6 +745,57 @@ impl Editor {
         // Refresh the overlay to update the block height for the new comment
         self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
 
+        cx.notify();
+    }
+
+    pub fn set_diff_review_handler(
+        &mut self,
+        handler: Option<Arc<dyn DiffReviewHandler>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff_review_handler = handler;
+        cx.notify();
+    }
+
+    pub fn has_diff_review_handler(&self) -> bool {
+        self.diff_review_handler.is_some()
+    }
+
+    fn submit_diff_review_to_handler(
+        &mut self,
+        button_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handler) = self.diff_review_handler.clone() else {
+            return;
+        };
+        let overlay_index = self
+            .diff_review_overlays
+            .iter()
+            .position(|overlay| overlay.prompt_editor.focus_handle(cx).is_focused(window))
+            .or_else(|| (!self.diff_review_overlays.is_empty()).then_some(0));
+        let Some(overlay_index) = overlay_index else {
+            return;
+        };
+        let comment = self.diff_review_overlays[overlay_index]
+            .prompt_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        if comment.is_empty() {
+            return;
+        }
+        let overlay = self.diff_review_overlays.remove(overlay_index);
+        self.remove_blocks(HashSet::from_iter([overlay.block_id]), None, cx);
+        let submission = DiffReviewSubmission {
+            editor: cx.entity(),
+            range: overlay.anchor_range,
+            comment,
+            button_index,
+        };
+        window.defer(cx, move |window, cx| handler.submit(submission, window, cx));
         cx.notify();
     }
 
@@ -2070,7 +2141,12 @@ impl Editor {
         snapshot: &MultiBufferSnapshot,
     ) -> u32 {
         let comment_count = self.hunk_comment_count(hunk_key, snapshot);
-        let base_height: u32 = 2; // Input row with avatar and buttons
+        // Input row with avatar and buttons, plus a row of handler buttons
+        let base_height: u32 = if self.diff_review_handler.is_some() {
+            3
+        } else {
+            2
+        };
 
         if comment_count == 0 {
             base_height
@@ -2571,6 +2647,14 @@ impl Editor {
                 })
                 .unwrap_or((Vec::new(), true, HashMap::default(), None, None));
 
+        let handler_labels = editor_handle
+            .upgrade()
+            .and_then(|editor| {
+                let handler = editor.read(cx).diff_review_handler.clone()?;
+                Some(handler.button_labels(cx))
+            })
+            .unwrap_or_default();
+
         let comment_count = comments.len();
         let avatar_size = px(20.);
         let action_icon_size = IconSize::XSmall;
@@ -2663,6 +2747,33 @@ impl Editor {
                             ),
                     ),
             )
+            .when(!handler_labels.is_empty(), |el| {
+                el.child(
+                    h_flex().w_full().justify_end().gap_2().children(
+                        handler_labels
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, label)| {
+                                let editor_handle = editor_handle.clone();
+                                Button::new(("diff-review-handler", index), label)
+                                    .style(if index == 0 {
+                                        ButtonStyle::Filled
+                                    } else {
+                                        ButtonStyle::Outlined
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        editor_handle
+                                            .update(cx, |editor, cx| {
+                                                editor.submit_diff_review_to_handler(
+                                                    index, window, cx,
+                                                );
+                                            })
+                                            .ok();
+                                    })
+                            }),
+                    ),
+                )
+            })
             // Expandable comments section (only shown when there are comments)
             .when(comment_count > 0, |el| {
                 el.child(Self::render_comments_section(

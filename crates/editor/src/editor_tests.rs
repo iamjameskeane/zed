@@ -46717,6 +46717,55 @@ fn test_diff_review_empty_comment_not_submitted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_handler_takes_over_submission(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    struct RecordingHandler(Arc<std::sync::Mutex<Vec<(String, usize)>>>);
+    impl DiffReviewHandler for RecordingHandler {
+        fn button_labels(&self, _cx: &App) -> Vec<SharedString> {
+            vec!["First".into(), "Second".into()]
+        }
+        fn submit(&self, submission: DiffReviewSubmission, _window: &mut Window, _cx: &mut App) {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((submission.comment, submission.button_index));
+        }
+    }
+
+    let submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_diff_review_handler(Some(Arc::new(RecordingHandler(submissions.clone()))), cx);
+        editor
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert("looks off", window, cx);
+                });
+            }
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        *submissions.lock().expect("lock"),
+        vec![("looks off".to_string(), 0)]
+    );
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(editor.total_review_comment_count(), 0);
+            assert!(editor.diff_review_overlays.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_inline_edit_flow(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -5,6 +5,7 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
+    pull_requests::pr_review::PullRequestReviewSession,
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -49,6 +50,7 @@ pub struct BranchDiff {
     diff: Entity<DiffMultibuffer>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    pull_request_review: Option<Entity<PullRequestReviewSession>>,
     _diff_event_subscription: Subscription,
 }
 
@@ -201,6 +203,30 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_branch_diff_with_base_ref_then(
+            workspace,
+            project,
+            intended_repo,
+            base_ref,
+            branch_diff,
+            window,
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    /// Like [`Self::deploy_branch_diff_with_base_ref`], and calls `on_ready` with the
+    /// activated tab, whether it was reused or newly created.
+    pub(crate) fn deploy_branch_diff_with_base_ref_then(
+        workspace: &mut Workspace,
+        project: Entity<Project>,
+        intended_repo: Entity<Repository>,
+        base_ref: SharedString,
+        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        on_ready: impl FnOnce(Entity<Self>, &mut Window, &mut Context<Workspace>) + 'static,
+    ) {
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
             matches!(
@@ -215,6 +241,7 @@ impl BranchDiff {
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
+            on_ready(existing, window, cx);
             return;
         }
 
@@ -237,7 +264,14 @@ impl BranchDiff {
                     .await?;
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(this.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        on_ready(this, window, cx);
                     })
                     .ok();
                 anyhow::Ok(())
@@ -368,6 +402,7 @@ impl BranchDiff {
             diff,
             project,
             workspace: workspace.downgrade(),
+            pull_request_review: None,
             _diff_event_subscription: diff_event_subscription,
         }
     }
@@ -431,9 +466,21 @@ impl BranchDiff {
             .detach_and_notify_err(workspace, window, cx);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
         self.diff.read(cx).editor().clone()
+    }
+
+    pub(crate) fn pull_request_review(&self) -> Option<&Entity<PullRequestReviewSession>> {
+        self.pull_request_review.as_ref()
+    }
+
+    pub(crate) fn set_pull_request_review(
+        &mut self,
+        session: Entity<PullRequestReviewSession>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pull_request_review = Some(session);
+        cx.notify();
     }
 }
 
@@ -633,10 +680,11 @@ impl Item for BranchDiff {
 
 impl Render for BranchDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
-            .child(self.diff.clone())
+            .children(self.pull_request_review.clone())
+            .child(div().flex_1().min_h_0().child(self.diff.clone()))
     }
 }
 
