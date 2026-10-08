@@ -349,6 +349,7 @@ impl UserMessage {
         const OPEN_DIAGNOSTICS_TAG: &str = "<diagnostics>";
         const OPEN_DIFFS_TAG: &str = "<diffs>";
         const MERGE_CONFLICT_TAG: &str = "<merge_conflicts>";
+        const PULL_REQUEST_TAG: &str = "<pull_requests>";
         const OPEN_SKILLS_TAG: &str =
             "<skills>\nThe user has attached the following agent skills:\n";
 
@@ -362,6 +363,7 @@ impl UserMessage {
         let mut diagnostics_context = OPEN_DIAGNOSTICS_TAG.to_string();
         let mut diffs_context = OPEN_DIFFS_TAG.to_string();
         let mut merge_conflict_context = MERGE_CONFLICT_TAG.to_string();
+        let mut pull_request_context = PULL_REQUEST_TAG.to_string();
         let mut skills_context = OPEN_SKILLS_TAG.to_string();
 
         for chunk in &*self.content {
@@ -468,6 +470,14 @@ impl UserMessage {
                             )
                             .ok();
                         }
+                        MentionUri::PullRequest { number } => {
+                            write!(
+                                &mut pull_request_context,
+                                "\nPull request #{}:\n{}\n",
+                                number, content
+                            )
+                            .ok();
+                        }
                         MentionUri::MergeConflict { file_path } => {
                             write!(
                                 &mut merge_conflict_context,
@@ -570,6 +580,13 @@ impl UserMessage {
             message
                 .content
                 .push(language_model::MessageContent::Text(merge_conflict_context));
+        }
+
+        if pull_request_context.len() > PULL_REQUEST_TAG.len() {
+            pull_request_context.push_str("</pull_requests>\n");
+            message
+                .content
+                .push(language_model::MessageContent::Text(pull_request_context));
         }
 
         if message.content.len() > len_before_context {
