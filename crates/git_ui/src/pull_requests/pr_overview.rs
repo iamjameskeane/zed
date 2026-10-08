@@ -24,6 +24,7 @@ use super::github_api::{
     Actor, GithubClient, GithubContext, PullRequestOverview, PullRequestState, ReviewEvent,
     TimelineItem,
 };
+use super::pr_review::{PullRequestReviewParams, PullRequestReviewSession};
 use crate::branch_diff::BranchDiff;
 
 const TAB_TITLE_MAX_LENGTH: usize = 28;
@@ -133,6 +134,23 @@ impl PullRequestOverviewView {
         };
         this.load(cx);
         this
+    }
+
+    pub fn open_and_focus_review_box(
+        workspace: &mut Workspace,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open(workspace, number, window, cx);
+        let Some(view) = workspace
+            .items_of_type::<Self>(cx)
+            .find(|item| item.read(cx).number == number)
+        else {
+            return;
+        };
+        let focus_handle = view.read(cx).review_editor.focus_handle(cx);
+        window.focus(&focus_handle, cx);
     }
 
     fn client(&self) -> GithubClient {
@@ -300,6 +318,17 @@ impl PullRequestOverviewView {
                             .update(cx, |editor, cx| editor.set_text("", window, cx));
                         this.review_status = ReviewStatus::Idle;
                         this.load(cx);
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                let sessions = workspace
+                                    .items_of_type::<BranchDiff>(cx)
+                                    .filter_map(|item| item.read(cx).pull_request_review().cloned())
+                                    .collect::<Vec<_>>();
+                                for session in sessions {
+                                    session.update(cx, |session, cx| session.refresh(window, cx));
+                                }
+                            })
+                            .log_err();
                     }
                     Err(error) => {
                         this.review_status = ReviewStatus::Failed(error.to_string().into());
@@ -726,30 +755,56 @@ pub fn open_pull_request_changes(
         .as_ref()
         .map(|branch| branch.name().to_string());
     let client = GithubClient::new(context.working_directory.clone());
+    let background_context = context.clone();
 
     cx.spawn_in(window, async move |_, cx| {
         let result = cx
             .background_spawn(async move {
-                let overview = client.fetch_overview(&context.repository, number).await?;
+                let overview = client
+                    .fetch_overview(&background_context.repository, number)
+                    .await?;
                 if current_branch.as_deref() != Some(overview.head_ref_name.as_str()) {
                     client.checkout_pull_request(number).await?;
                 }
-                fetch_base_ref(&context.working_directory, &overview.base_ref_name).await?;
-                anyhow::Ok(overview.base_ref_name)
+                fetch_base_ref(
+                    &background_context.working_directory,
+                    &overview.base_ref_name,
+                )
+                .await?;
+                anyhow::Ok(overview)
             })
             .await;
         match result {
-            Ok(base_ref_name) => {
+            Ok(overview) => {
                 workspace_handle
                     .update_in(cx, |workspace, window, cx| {
-                        BranchDiff::deploy_branch_diff_with_base_ref(
+                        let session_workspace = workspace.weak_handle();
+                        let session_project = project.clone();
+                        let session_repository = repository.clone();
+                        BranchDiff::deploy_branch_diff_with_base_ref_then(
                             workspace,
                             project,
                             repository,
-                            format!("origin/{base_ref_name}").into(),
+                            format!("origin/{}", overview.base_ref_name).into(),
                             None,
                             window,
                             cx,
+                            move |branch_diff, window, cx| {
+                                PullRequestReviewSession::attach(
+                                    &branch_diff,
+                                    PullRequestReviewParams {
+                                        workspace: session_workspace,
+                                        project: session_project,
+                                        repository: session_repository,
+                                        context,
+                                        number,
+                                        pull_request_id: overview.id,
+                                        head_oid: overview.head_ref_oid,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            },
                         );
                     })
                     .log_err();
@@ -783,7 +838,10 @@ async fn fetch_base_ref(working_directory: &Path, base_ref_name: &str) -> anyhow
     Ok(())
 }
 
-fn github_context(project: &Entity<Project>, cx: &gpui::App) -> Result<GithubContext, String> {
+pub(super) fn github_context(
+    project: &Entity<Project>,
+    cx: &gpui::App,
+) -> Result<GithubContext, String> {
     let repository = project
         .read(cx)
         .git_store()
@@ -793,7 +851,7 @@ fn github_context(project: &Entity<Project>, cx: &gpui::App) -> Result<GithubCon
     GithubContext::from_repository(repository.read(cx), cx).map_err(|error| error.to_string())
 }
 
-fn show_toast<C: AppContext>(
+pub(super) fn show_toast<C: AppContext>(
     workspace: &WeakEntity<Workspace>,
     message: String,
     autohide: bool,
@@ -834,7 +892,7 @@ fn validate_review_body(event: ReviewEvent, body: &str) -> Result<(), &'static s
     }
 }
 
-fn format_relative_time(timestamp: &str, now: OffsetDateTime) -> String {
+pub(super) fn format_relative_time(timestamp: &str, now: OffsetDateTime) -> String {
     let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
         return timestamp.to_string();
     };
@@ -928,7 +986,7 @@ fn label_colors(hex: &str) -> (Hsla, Hsla) {
     (gpui::rgb(value).into(), foreground)
 }
 
-fn avatar(actor: Option<&Actor>) -> gpui::AnyElement {
+pub(super) fn avatar(actor: Option<&Actor>) -> gpui::AnyElement {
     match actor.and_then(|actor| actor.avatar_url.clone()) {
         Some(url) => Avatar::new(SharedString::from(url))
             .size(px(20.))
