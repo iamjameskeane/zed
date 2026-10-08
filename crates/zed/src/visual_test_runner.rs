@@ -2766,6 +2766,7 @@ fn run_pull_request_visual_tests(
             context.clone(),
             threads.clone(),
             Some("PRR_pending".into()),
+            time::macros::datetime!(2026-10-08 09:30:00 UTC),
             window,
             cx,
         );

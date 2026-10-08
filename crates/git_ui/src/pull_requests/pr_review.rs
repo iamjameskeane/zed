@@ -31,6 +31,7 @@ const PENDING_STATE: &str = "PENDING";
 const REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
 const CHARACTERS_PER_ROW: usize = 80;
 const REPLY_EDITOR_ROWS: u32 = 2;
+const CARD_CHROME_ROWS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReviewPosition {
@@ -84,7 +85,6 @@ pub(crate) fn review_position(
 pub(crate) struct ThreadPlacement {
     pub in_base_editor: bool,
     pub anchor: Anchor,
-    pub exact: bool,
 }
 
 fn clamp_row(row: u32, buffer: &language::BufferSnapshot) -> Option<u32> {
@@ -119,14 +119,12 @@ pub(crate) fn place_thread(
         Some(ThreadPlacement {
             in_base_editor: false,
             anchor: start_of_file_anchor(snapshot, buffer_id)?,
-            exact: false,
         })
     };
 
     let Some(requested_row) = requested_row else {
         return fallback();
     };
-    let exact = thread.line.is_some();
 
     if side == DiffSide::Left {
         if let Some((base_snapshot, base_id)) = base_snapshot {
@@ -137,12 +135,10 @@ pub(crate) fn place_thread(
                 Some(anchor) => ThreadPlacement {
                     in_base_editor: true,
                     anchor,
-                    exact,
                 },
                 None => ThreadPlacement {
                     in_base_editor: true,
                     anchor: start_of_file_anchor(base_snapshot, base_id)?,
-                    exact: false,
                 },
             });
         }
@@ -172,7 +168,6 @@ pub(crate) fn place_thread(
                     return Some(ThreadPlacement {
                         in_base_editor: false,
                         anchor,
-                        exact,
                     });
                 }
             } else if let Some(anchor) = clamp_row(buffer_point.row, buffer)
@@ -181,7 +176,6 @@ pub(crate) fn place_thread(
                 return Some(ThreadPlacement {
                     in_base_editor: false,
                     anchor,
-                    exact,
                 });
             }
         }
@@ -193,7 +187,6 @@ pub(crate) fn place_thread(
         Some(anchor) => Some(ThreadPlacement {
             in_base_editor: false,
             anchor,
-            exact,
         }),
         None => fallback(),
     }
@@ -208,7 +201,7 @@ fn estimate_body_rows(body: &str) -> u32 {
 
 fn estimate_thread_rows(thread: &ReviewThread, expanded: bool) -> u32 {
     if !expanded {
-        return 1;
+        return 2;
     }
     let comment_rows: u32 = thread
         .comments
@@ -216,11 +209,11 @@ fn estimate_thread_rows(thread: &ReviewThread, expanded: bool) -> u32 {
         .map(|comment| 1 + estimate_body_rows(&comment.body))
         .sum();
     let reply_rows = if thread.viewer_can_reply {
-        REPLY_EDITOR_ROWS + 1
+        REPLY_EDITOR_ROWS
     } else {
         0
     };
-    1 + comment_rows + reply_rows + 1
+    1 + comment_rows + reply_rows + CARD_CHROME_ROWS
 }
 
 enum ThreadViewEvent {
@@ -235,7 +228,7 @@ struct ThreadView {
     expanded: bool,
     busy: bool,
     error: Option<SharedString>,
-    exact_location: bool,
+    fixed_now: Option<OffsetDateTime>,
 }
 
 impl EventEmitter<ThreadViewEvent> for ThreadView {}
@@ -244,6 +237,7 @@ impl ThreadView {
     fn new(
         session: WeakEntity<PullRequestReviewSession>,
         thread: ReviewThread,
+        fixed_now: Option<OffsetDateTime>,
         project: &Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -266,7 +260,7 @@ impl ThreadView {
             reply_editor,
             busy: false,
             error: None,
-            exact_location: true,
+            fixed_now,
         };
         this.rebuild_bodies(project, cx);
         this
@@ -392,6 +386,12 @@ impl ThreadView {
             .unwrap_or_else(|| "ghost".to_string());
         v_flex()
             .w_full()
+            .when(index > 0, |this| {
+                this.mt_1()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -400,7 +400,7 @@ impl ThreadView {
                     .child(
                         Label::new(format_relative_time(
                             &comment.created_at,
-                            OffsetDateTime::now_utc(),
+                            self.fixed_now.unwrap_or_else(OffsetDateTime::now_utc),
                         ))
                         .color(Color::Muted)
                         .size(LabelSize::Small),
@@ -427,145 +427,163 @@ impl Render for ThreadView {
         let comment_count = thread.comments.len();
 
         if !self.expanded {
-            return h_flex()
+            return div()
                 .id(SharedString::from(format!("review-thread-{}", thread.id)))
-                .w_full()
-                .h_full()
+                .size_full()
                 .px_3()
-                .gap_2()
-                .items_center()
-                .cursor_pointer()
-                .bg(colors.editor_background)
-                .border_y_1()
-                .border_color(colors.border_variant)
-                .hover(|style| style.bg(colors.element_hover))
-                .on_click(cx.listener(|this, _, _, cx| this.set_expanded(true, cx)))
+                .py_1()
                 .child(
-                    Icon::new(IconName::ChevronRight)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(format!(
-                        "Resolved · {comment_count} {}",
-                        if comment_count == 1 {
-                            "comment"
-                        } else {
-                            "comments"
-                        }
-                    ))
-                    .color(Color::Muted)
-                    .size(LabelSize::Small),
+                    h_flex()
+                        .id(SharedString::from(format!("expand-{}", thread.id)))
+                        .size_full()
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .cursor_pointer()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .hover(|style| style.bg(colors.element_hover))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_expanded(true, cx)))
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "Resolved · {comment_count} {}",
+                                if comment_count == 1 {
+                                    "comment"
+                                } else {
+                                    "comments"
+                                }
+                            ))
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                        ),
                 )
                 .into_any_element();
         }
 
-        let location = match thread.line.or(thread.original_line) {
-            Some(line) if !self.exact_location || outdated => {
-                format!("{}:{line}", thread.path)
-            }
-            _ => String::new(),
-        };
+        let location = thread
+            .line
+            .or(thread.original_line)
+            .map(|line| format!("{}:{line}", thread.path))
+            .unwrap_or_default();
         let can_resolve = thread.viewer_can_resolve;
         let can_reply = thread.viewer_can_reply;
         let busy = self.busy;
         let resolved = thread.is_resolved;
 
-        v_flex()
+        div()
             .id(SharedString::from(format!("review-thread-{}", thread.id)))
-            .w_full()
-            .h_full()
-            .overflow_hidden()
+            .size_full()
             .px_3()
             .py_1()
-            .gap_1()
-            .bg(colors.editor_background)
-            .border_y_1()
-            .border_color(colors.border_variant)
             .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .when(resolved, |this| {
+                v_flex()
+                    .size_full()
+                    .overflow_hidden()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.elevated_surface_background)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .when(resolved, |this| {
+                                this.child(
+                                    IconButton::new(
+                                        SharedString::from(format!("collapse-{}", thread.id)),
+                                        IconName::ChevronDown,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.set_expanded(false, cx)),
+                                    ),
+                                )
+                            })
+                            .when(!location.is_empty(), |this| {
+                                this.child(
+                                    Label::new(location)
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small),
+                                )
+                            })
+                            .when(outdated, |this| {
+                                this.child(Chip::new("Outdated").label_color(Color::Warning))
+                            })
+                            .when(resolved, |this| {
+                                this.child(Chip::new("Resolved").label_color(Color::Success))
+                            })
+                            .when(self.pending_comment_count() > 0, |this| {
+                                this.child(Chip::new("Pending").label_color(Color::Warning))
+                            })
+                            .child(div().flex_1())
+                            .when_some(self.error.clone(), |this, error| {
+                                this.child(
+                                    Label::new(error).color(Color::Error).size(LabelSize::Small),
+                                )
+                            })
+                            .when(can_resolve, |this| {
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("resolve-{}", thread.id)),
+                                        if resolved { "Unresolve" } else { "Resolve" },
+                                    )
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::Small)
+                                    .disabled(busy)
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_resolved(window, cx),
+                                    )),
+                                )
+                            }),
+                    )
+                    .children(
+                        thread
+                            .comments
+                            .iter()
+                            .enumerate()
+                            .map(|(index, comment)| self.render_comment(index, comment, window, cx))
+                            .collect::<Vec<_>>(),
+                    )
+                    .when(can_reply, |this| {
                         this.child(
-                            IconButton::new(
-                                SharedString::from(format!("collapse-{}", thread.id)),
-                                IconName::ChevronDown,
-                            )
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_expanded(false, cx))),
-                        )
-                    })
-                    .when(!location.is_empty(), |this| {
-                        this.child(
-                            Label::new(location)
-                                .color(Color::Muted)
-                                .size(LabelSize::Small),
-                        )
-                    })
-                    .when(outdated, |this| {
-                        this.child(Chip::new("Outdated").label_color(Color::Warning))
-                    })
-                    .when(resolved, |this| {
-                        this.child(Chip::new("Resolved").label_color(Color::Success))
-                    })
-                    .when(self.pending_comment_count() > 0, |this| {
-                        this.child(Chip::new("Pending").label_color(Color::Warning))
-                    })
-                    .child(div().flex_1())
-                    .when_some(self.error.clone(), |this, error| {
-                        this.child(Label::new(error).color(Color::Error).size(LabelSize::Small))
-                    })
-                    .when(can_resolve, |this| {
-                        this.child(
-                            Button::new(
-                                SharedString::from(format!("resolve-{}", thread.id)),
-                                if resolved { "Unresolve" } else { "Resolve" },
-                            )
-                            .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::Small)
-                            .disabled(busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.toggle_resolved(window, cx)),
-                            ),
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .px_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .child(self.reply_editor.clone()),
+                                )
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("reply-{}", thread.id)),
+                                        "Reply",
+                                    )
+                                    .style(ButtonStyle::Filled)
+                                    .disabled(busy)
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.reply(window, cx)),
+                                    ),
+                                ),
                         )
                     }),
             )
-            .children(
-                thread
-                    .comments
-                    .iter()
-                    .enumerate()
-                    .map(|(index, comment)| self.render_comment(index, comment, window, cx))
-                    .collect::<Vec<_>>(),
-            )
-            .when(can_reply, |this| {
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .items_start()
-                        .child(
-                            div()
-                                .flex_1()
-                                .px_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border)
-                                .child(self.reply_editor.clone()),
-                        )
-                        .child(
-                            Button::new(
-                                SharedString::from(format!("reply-{}", thread.id)),
-                                "Reply",
-                            )
-                            .style(ButtonStyle::Filled)
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.reply(window, cx))),
-                        ),
-                )
-            })
             .into_any_element()
     }
 }
@@ -597,6 +615,7 @@ pub struct PullRequestReviewSession {
     splittable: Entity<SplittableEditor>,
     threads: Vec<ReviewThread>,
     pending_review_id: Option<String>,
+    fixed_now: Option<OffsetDateTime>,
     thread_views: HashMap<String, Entity<ThreadView>>,
     blocks: Vec<PlacedBlock>,
     observed_base_editor: Option<EntityId>,
@@ -614,6 +633,7 @@ pub fn open_review_with_fixture(
     context: GithubContext,
     threads: Vec<ReviewThread>,
     pending_review_id: Option<String>,
+    now: OffsetDateTime,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -641,6 +661,7 @@ pub fn open_review_with_fixture(
                 params,
                 threads,
                 pending_review_id,
+                now,
                 window,
                 cx,
             );
@@ -720,6 +741,7 @@ impl PullRequestReviewSession {
             splittable,
             threads: Vec::new(),
             pending_review_id: None,
+            fixed_now: None,
             thread_views: HashMap::default(),
             blocks: Vec::new(),
             observed_base_editor: None,
@@ -738,12 +760,14 @@ impl PullRequestReviewSession {
         params: PullRequestReviewParams,
         threads: Vec<ReviewThread>,
         pending_review_id: Option<String>,
+        now: OffsetDateTime,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let splittable = branch_diff.read(cx).editor(cx);
         let session = cx.new(|cx| {
             let mut session = Self::new(params, splittable, cx);
+            session.fixed_now = Some(now);
             session.apply(threads, pending_review_id, window, cx);
             session
         });
@@ -864,8 +888,11 @@ impl PullRequestReviewSession {
                     let session = cx.weak_entity();
                     let project = self.project.clone();
                     let thread = thread.clone();
+                    let fixed_now = self.fixed_now;
                     let id = thread.id.clone();
-                    let view = cx.new(|cx| ThreadView::new(session, thread, &project, window, cx));
+                    let view = cx.new(|cx| {
+                        ThreadView::new(session, thread, fixed_now, &project, window, cx)
+                    });
                     cx.subscribe(
                         &view,
                         |this, view, event: &ThreadViewEvent, cx| match event {
@@ -964,7 +991,6 @@ impl PullRequestReviewSession {
                 (Some(lhs_editor), true) => lhs_editor.clone(),
                 _ => rhs_editor.clone(),
             };
-            view.update(cx, |view, _| view.exact_location = placement.exact);
             let render_view = view.clone();
             let rows = view.read(cx).rows();
             new_blocks.push((
@@ -1396,28 +1422,16 @@ mod tests {
         let (snapshot, buffer_id) = diff_snapshot(cx);
         let placed_row = |thread: &ReviewThread| {
             let placement = place_thread(thread, &snapshot, buffer_id, None).expect("placement");
-            (placement.anchor.to_point(&snapshot).row, placement.exact)
+            placement.anchor.to_point(&snapshot).row
         };
 
-        assert_eq!(
-            placed_row(&thread(Some(DiffSide::Right), Some(2), None)),
-            (2, true)
-        );
-        assert_eq!(
-            placed_row(&thread(Some(DiffSide::Left), Some(2), None)),
-            (1, true)
-        );
-        assert_eq!(
-            placed_row(&thread(Some(DiffSide::Left), Some(1), None)),
-            (0, true)
-        );
-        assert_eq!(
-            placed_row(&thread(Some(DiffSide::Right), None, Some(3))),
-            (3, false)
-        );
+        assert_eq!(placed_row(&thread(Some(DiffSide::Right), Some(2), None)), 2);
+        assert_eq!(placed_row(&thread(Some(DiffSide::Left), Some(2), None)), 1);
+        assert_eq!(placed_row(&thread(Some(DiffSide::Left), Some(1), None)), 0);
+        assert_eq!(placed_row(&thread(Some(DiffSide::Right), None, Some(3))), 3);
         assert_eq!(
             placed_row(&thread(Some(DiffSide::Right), None, Some(99))),
-            (0, false)
+            0
         );
     }
 
@@ -1435,7 +1449,7 @@ mod tests {
         let collapsed = estimate_thread_rows(&resolved, false);
         let expanded = estimate_thread_rows(&resolved, true);
         resolved.viewer_can_reply = false;
-        assert_eq!(collapsed, 1);
+        assert_eq!(collapsed, 2);
         assert!(expanded > collapsed);
         assert!(estimate_thread_rows(&resolved, true) < expanded);
     }
