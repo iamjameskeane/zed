@@ -1,7 +1,10 @@
 pub mod github_api;
+pub mod pr_overview;
 pub mod pr_panel;
 
 use gpui::{App, actions};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use workspace::Workspace;
 
 pub use pr_panel::PullRequestPanel;
@@ -18,6 +21,13 @@ actions!(
     ]
 );
 
+/// Opens the changes of a pull request in a branch diff against its base branch.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, gpui::Action)]
+#[action(namespace = pull_requests)]
+pub struct OpenPullRequestChanges {
+    pub number: u64,
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &TogglePanel, window, cx| {
@@ -25,6 +35,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &OpenPullRequest, window, cx| {
             prompt_for_pull_request_number(workspace, pr_panel::NumberPromptMode::Open, window, cx);
+        });
+        workspace.register_action(|workspace, action: &OpenPullRequestChanges, window, cx| {
+            pr_overview::open_pull_request_changes(workspace, action.number, window, cx);
         });
         workspace.register_action(|workspace, _: &CheckoutPullRequest, window, cx| {
             prompt_for_pull_request_number(
