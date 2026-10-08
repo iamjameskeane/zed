@@ -87,13 +87,21 @@ impl PullRequestOverviewView {
     ) {
         let workspace_handle = workspace.weak_handle();
         let project = workspace.project().clone();
-        let context = match github_context(&project, cx) {
-            Ok(context) => context,
-            Err(message) => {
-                show_toast(&workspace_handle, message, false, cx);
-                return;
-            }
-        };
+        match github_context(&project, cx) {
+            Ok(context) => Self::open_with_context(workspace, context, number, window, cx),
+            Err(message) => show_toast(&workspace_handle, message, false, cx),
+        }
+    }
+
+    pub fn open_with_context(
+        workspace: &mut Workspace,
+        context: GithubContext,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
             item.number == number && item.context.repository == context.repository
