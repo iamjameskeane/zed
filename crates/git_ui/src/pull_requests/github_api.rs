@@ -323,6 +323,14 @@ impl GithubClient {
         parse_branch_pull_request(output)
     }
 
+    pub async fn pull_request_diff(&self, number: u64) -> Result<String, GithubError> {
+        run_gh(
+            &self.working_directory,
+            &["pr", "diff", &number.to_string()],
+        )
+        .await
+    }
+
     pub async fn checkout_pull_request(&self, number: u64) -> Result<(), GithubError> {
         run_gh(
             &self.working_directory,

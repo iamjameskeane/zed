@@ -24,6 +24,7 @@ use super::github_api::{
     DiffSide, GithubClient, GithubContext, NewReviewThread, ReviewComment, ReviewEvent,
     ReviewThread,
 };
+use super::pr_ask_ai::{ai_enabled, ask_ai_about_pull_request};
 use super::pr_overview::{PullRequestOverviewView, avatar, format_relative_time, show_toast};
 use crate::branch_diff::BranchDiff;
 
@@ -600,6 +601,7 @@ pub struct PullRequestReviewParams {
     pub repository: Entity<Repository>,
     pub context: GithubContext,
     pub number: u64,
+    pub title: SharedString,
     pub pull_request_id: String,
     pub head_oid: String,
 }
@@ -610,6 +612,7 @@ pub struct PullRequestReviewSession {
     git_repository: Entity<Repository>,
     context: GithubContext,
     number: u64,
+    title: SharedString,
     pull_request_id: String,
     head_oid: String,
     splittable: Entity<SplittableEditor>,
@@ -643,7 +646,8 @@ pub fn open_review_with_fixture(
         project: project.clone(),
         repository: repository.clone(),
         context,
-        number: 1,
+        number: 412,
+        title: "Retry failed requests with exponential backoff".into(),
         pull_request_id: "fixture".into(),
         head_oid: "fixture".into(),
     };
@@ -736,6 +740,7 @@ impl PullRequestReviewSession {
             git_repository: params.repository,
             context: params.context,
             number: params.number,
+            title: params.title,
             pull_request_id: params.pull_request_id,
             head_oid: params.head_oid,
             splittable,
@@ -1264,10 +1269,8 @@ fn repo_path_for_buffer(
 
 impl Render for PullRequestReviewSession {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.pending_review_id.is_none() {
-            return div().into_any_element();
-        }
         let count = self.pending_comment_count();
+        let has_pending_review = self.pending_review_id.is_some();
         let colors = cx.theme().colors();
         h_flex()
             .w_full()
@@ -1279,27 +1282,55 @@ impl Render for PullRequestReviewSession {
             .border_b_1()
             .border_color(colors.border)
             .child(
-                Label::new(format!(
-                    "Pending review · {count} {}",
-                    if count == 1 { "comment" } else { "comments" }
-                ))
-                .size(LabelSize::Small)
-                .weight(FontWeight::SEMIBOLD),
+                Label::new(format!("PR #{} · {}", self.number, self.title))
+                    .size(LabelSize::Small)
+                    .weight(FontWeight::SEMIBOLD)
+                    .truncate(),
             )
+            .when(ai_enabled(cx), |this| {
+                this.child(
+                    Button::new("pull-request-ask-ai", "Ask AI")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::ZedAssistant).size(IconSize::XSmall))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            ask_ai_about_pull_request(
+                                this.workspace.clone(),
+                                this.context.clone(),
+                                this.number,
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+            })
             .child(div().flex_1())
-            .child(
-                Button::new("pending-review-discard", "Discard")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, window, cx| this.discard_review(window, cx))),
-            )
-            .child(
-                Button::new("pending-review-submit", "Submit Review")
-                    .style(ButtonStyle::Filled)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, window, cx| this.submit_review(window, cx))),
-            )
-            .into_any_element()
+            .when(has_pending_review, |this| {
+                this.child(
+                    Label::new(format!(
+                        "Pending review · {count} {}",
+                        if count == 1 { "comment" } else { "comments" }
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Button::new("pending-review-discard", "Discard")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.discard_review(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("pending-review-submit", "Submit Review")
+                        .style(ButtonStyle::Filled)
+                        .label_size(LabelSize::Small)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit_review(window, cx)),
+                        ),
+                )
+            })
     }
 }
 

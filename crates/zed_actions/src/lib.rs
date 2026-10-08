@@ -627,6 +627,17 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// Opens a new agent thread with a pull request attached as context, ready for a question.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct AskAboutPullRequest {
+        /// The pull request number.
+        pub number: u64,
+        /// The pull request details, diff and review threads as text.
+        pub context: SharedString,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

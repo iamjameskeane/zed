@@ -1,12 +1,13 @@
 pub mod github_api;
+pub mod pr_ask_ai;
 pub mod pr_overview;
 pub mod pr_review;
 pub mod pr_status;
 
 use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Window, actions,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Window,
+    actions,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -88,8 +89,7 @@ pub(crate) fn open_current_branch_pull_request(
         workspace_handle
             .update_in(cx, |workspace, window, cx| match result {
                 Ok(Some(pull_request)) => {
-                    let Some(repository) = pull_request.repository().or(fallback_repository)
-                    else {
+                    let Some(repository) = pull_request.repository().or(fallback_repository) else {
                         show_toast(
                             &workspace.weak_handle(),
                             GithubError::NotGithubRepository.to_string(),
