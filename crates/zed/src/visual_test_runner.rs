@@ -2455,11 +2455,11 @@ fn run_pull_request_visual_tests(
     update_baseline: bool,
 ) -> Result<TestResult> {
     use git_ui::pull_requests::{
-        PullRequestStatusItem,
+        PullRequestChangesPanel, PullRequestStatusItem,
         github_api::{
-            Actor, BranchPullRequest, DiffSide, GithubContext, GithubRepository, Label,
-            LatestReview, PullRequestOverview, PullRequestState, ReviewComment, ReviewThread,
-            TimelineItem,
+            Actor, BranchPullRequest, DiffSide, FileChangeType, GithubContext, GithubRepository,
+            Label, LatestReview, PullRequestFile, PullRequestOverview, PullRequestState,
+            ReviewComment, ReviewThread, TimelineItem,
         },
         pr_overview::PullRequestOverviewView,
         pr_review::open_review_with_fixture,
@@ -2727,6 +2727,52 @@ fn run_pull_request_visual_tests(
     settle(cx, window)?;
     results.push(run_visual_test(
         "pr_review_overlay",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+
+    // pr_changes_panel
+    let file = |path: &str, change_type: FileChangeType, additions: u32, deletions: u32| {
+        PullRequestFile {
+            path: path.into(),
+            additions,
+            deletions,
+            change_type,
+        }
+    };
+    let changed_files = vec![
+        file("Cargo.toml", FileChangeType::Modified, 1, 0),
+        file("docs/guide/retries.md", FileChangeType::Added, 24, 0),
+        file("src/client/backoff.rs", FileChangeType::Added, 18, 0),
+        file("src/client/retry.rs", FileChangeType::Modified, 42, 8),
+        file("src/legacy_retry.rs", FileChangeType::Deleted, 0, 57),
+        file("src/lib.rs", FileChangeType::Modified, 6, 2),
+    ];
+    let window = open_pull_request_fixture_window(
+        &app_state,
+        cx,
+        &project_path,
+        size(px(900.0), px(620.0)),
+    )?;
+    window.update(cx, |workspace, window, cx| {
+        let panel = PullRequestChangesPanel::new_with_fixture(
+            workspace,
+            context.clone(),
+            overview_for_context.clone(),
+            changed_files,
+            threads.clone(),
+            cx,
+        );
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<PullRequestChangesPanel>(window, cx);
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test(
+        "pr_changes_panel",
         window.into(),
         cx,
         update_baseline,

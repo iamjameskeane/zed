@@ -57,6 +57,7 @@ pub struct DiffMultibuffer {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
+    pending_scroll_repo_path: Option<RepoPath>,
     review_comment_count: usize,
     empty_label: SharedString,
     _task: Task<Result<()>>,
@@ -118,6 +119,7 @@ impl DiffMultibuffer {
                 }
                 BranchDiffEvent::DiffBaseChanged => {
                     this.pending_scroll.take();
+                    this.pending_scroll_repo_path.take();
                     this._task = window.spawn(cx, {
                         let this = cx.weak_entity();
                         async |cx| Self::refresh(this, cx).await
@@ -169,6 +171,7 @@ impl DiffMultibuffer {
             multibuffer,
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
+            pending_scroll_repo_path: None,
             review_comment_count: 0,
             empty_label: empty_label.into(),
             _task: task,
@@ -246,6 +249,26 @@ impl DiffMultibuffer {
             .unwrap_or(FileStatus::Untracked);
         let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
         self.move_to_path(path_key, window, cx)
+    }
+
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded_path_key = self.buffer_subscriptions.get(&repo_path).and_then(|loaded| {
+            let buffer_id = loaded.display_buffer.read(cx).remote_id();
+            self.multibuffer
+                .read(cx)
+                .snapshot(cx)
+                .path_for_buffer(buffer_id)
+                .cloned()
+        });
+        match loaded_path_key {
+            Some(path_key) => self.move_to_path(path_key, window, cx),
+            None => self.pending_scroll_repo_path = Some(repo_path),
+        }
     }
 
     pub(crate) fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -495,6 +518,7 @@ impl DiffMultibuffer {
                 }
             })
         });
+        let scroll_requested = self.pending_scroll_repo_path.as_ref() == Some(&repo_path);
         self.buffer_subscriptions.insert(
             repo_path,
             BufferSubscriptions {
@@ -587,7 +611,8 @@ impl DiffMultibuffer {
                 editor.focus_handle(cx).focus(window, cx);
             });
         }
-        if self.pending_scroll.as_ref() == Some(&path_key) {
+        if scroll_requested || self.pending_scroll.as_ref() == Some(&path_key) {
+            self.pending_scroll_repo_path.take();
             self.move_to_path(path_key, window, cx);
         }
 
@@ -729,6 +754,7 @@ impl DiffMultibuffer {
                 });
             }
             this.pending_scroll.take();
+            this.pending_scroll_repo_path.take();
             cx.notify();
         })?;
 

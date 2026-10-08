@@ -781,6 +781,10 @@ impl PullRequestReviewSession {
         });
     }
 
+    pub(crate) fn number(&self) -> u64 {
+        self.number
+    }
+
     fn client(&self) -> GithubClient {
         GithubClient::new(self.context.working_directory.clone())
     }
