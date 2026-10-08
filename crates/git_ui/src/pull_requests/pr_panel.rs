@@ -18,6 +18,7 @@ use super::github_api::{
     FileChangeType, GithubClient, GithubContext, GithubError, PullRequestFile, PullRequestList,
     PullRequestListKind, PullRequestSummary, ViewedState,
 };
+use super::pr_overview::PullRequestOverviewView;
 
 const PULL_REQUEST_PANEL_KEY: &str = "PullRequestPanel";
 
@@ -240,13 +241,23 @@ impl PullRequestPanel {
                     "https://github.com/{}/pull/{number}",
                     context.repository.full_name()
                 );
-                self.open_pull_request(number, url, cx);
+                self.open_pull_request(number, url, window, cx);
             }
         }
     }
 
-    fn open_pull_request(&mut self, number: u64, url: String, cx: &mut Context<Self>) {
-        cx.open_url(&url);
+    fn open_pull_request(
+        &mut self,
+        number: u64,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                PullRequestOverviewView::open(workspace, number, window, cx);
+            })
+            .log_err();
         cx.emit(PullRequestPanelEvent::OpenPullRequest { number, url });
     }
 
@@ -527,6 +538,7 @@ impl PullRequestPanel {
         let expanded = self.expanded.get(&number);
         let toggle_target = pull_request.clone();
         let open_target = pull_request.clone();
+        let github_url = pull_request.url.clone();
         let author = pull_request
             .author
             .as_ref()
@@ -542,8 +554,13 @@ impl PullRequestPanel {
                     .on_toggle(cx.listener(move |this, _, _, cx| {
                         this.toggle_pull_request(&toggle_target, cx);
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_pull_request(open_target.number, open_target.url.clone(), cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_pull_request(
+                            open_target.number,
+                            open_target.url.clone(),
+                            window,
+                            cx,
+                        );
                     }))
                     .tooltip(Tooltip::text(pull_request.title.clone()))
                     .child(
@@ -569,9 +586,22 @@ impl PullRequestPanel {
                             }),
                     )
                     .end_slot(
-                        Label::new(author)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new(author)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new(
+                                    ("pull-request-github", number as usize),
+                                    IconName::ArrowUpRight,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Open on GitHub"))
+                                .on_click(move |_, _, cx| cx.open_url(&github_url)),
+                            ),
                     ),
             )
             .when_some(expanded, |this, expanded| {
