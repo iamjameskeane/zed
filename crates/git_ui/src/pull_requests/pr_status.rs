@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use collections::HashMap;
-use gpui::{App, Context, Empty, Entity, IntoElement, Render, Subscription, Task, Window};
+use gpui::{
+    App, Context, Empty, Entity, EntityId, Global, IntoElement, Render, Subscription, Task,
+    WeakEntity, Window,
+};
 use project::{
     Project,
     git_store::{GitStoreEvent, RepositoryEvent},
@@ -17,9 +20,23 @@ const LOOKUP_DEBOUNCE: Duration = Duration::from_millis(300);
 
 type BranchKey = (PathBuf, String);
 
-pub struct PullRequestStatusItem {
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchLookup {
+    Unavailable,
+    Loading,
+    NoPullRequest { branch: String },
+    Failed(String),
+    Found(BranchPullRequest),
+}
+
+#[derive(Default)]
+struct LookupRegistry(HashMap<EntityId, WeakEntity<BranchPullRequestLookup>>);
+
+impl Global for LookupRegistry {}
+
+pub struct BranchPullRequestLookup {
     project: Entity<Project>,
-    pull_request: Option<BranchPullRequest>,
+    state: BranchLookup,
     cache: HashMap<BranchKey, BranchPullRequest>,
     lookups_enabled: bool,
     error_logged: bool,
@@ -27,9 +44,26 @@ pub struct PullRequestStatusItem {
     _subscription: Subscription,
 }
 
-impl PullRequestStatusItem {
-    pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
-        let project = workspace.project().clone();
+impl BranchPullRequestLookup {
+    pub fn shared(project: &Entity<Project>, cx: &mut App) -> Entity<Self> {
+        let existing = cx
+            .default_global::<LookupRegistry>()
+            .0
+            .get(&project.entity_id())
+            .and_then(|lookup| lookup.upgrade());
+        if let Some(existing) = existing {
+            return existing;
+        }
+        let lookup = cx.new(|cx| Self::new(project.clone(), cx));
+        let registry = cx.default_global::<LookupRegistry>();
+        registry.0.retain(|_, lookup| lookup.upgrade().is_some());
+        registry
+            .0
+            .insert(project.entity_id(), lookup.downgrade());
+        lookup
+    }
+
+    fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
         let git_store = project.read(cx).git_store().clone();
         let subscription = cx.subscribe(&git_store, |this, _, event, cx| {
             if matches!(
@@ -42,7 +76,7 @@ impl PullRequestStatusItem {
         });
         let mut this = Self {
             project,
-            pull_request: None,
+            state: BranchLookup::Unavailable,
             cache: HashMap::default(),
             lookups_enabled: true,
             error_logged: false,
@@ -53,17 +87,16 @@ impl PullRequestStatusItem {
         this
     }
 
+    pub fn state(&self) -> &BranchLookup {
+        &self.state
+    }
+
     #[cfg(any(test, feature = "test-support"))]
-    pub fn new_with_fixture(
-        workspace: &Workspace,
-        pull_request: BranchPullRequest,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut this = Self::new(workspace, cx);
-        this.lookups_enabled = false;
-        this.lookup_task = Task::ready(());
-        this.pull_request = Some(pull_request);
-        this
+    pub fn set_fixture(&mut self, state: BranchLookup, cx: &mut Context<Self>) {
+        self.lookups_enabled = false;
+        self.lookup_task = Task::ready(());
+        self.state = state;
+        cx.notify();
     }
 
     fn current_branch_key(&self, cx: &App) -> Option<BranchKey> {
@@ -77,23 +110,30 @@ impl PullRequestStatusItem {
         Some((repository.work_directory_abs_path.to_path_buf(), branch))
     }
 
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.current_branch_key(cx) {
+            self.cache.remove(&key);
+        }
+        self.refresh(cx);
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if !self.lookups_enabled {
             return;
         }
         let Some(key) = self.current_branch_key(cx) else {
-            self.pull_request = None;
+            self.state = BranchLookup::Unavailable;
             self.lookup_task = Task::ready(());
             cx.notify();
             return;
         };
         if let Some(cached) = self.cache.get(&key) {
-            self.pull_request = Some(cached.clone());
+            self.state = BranchLookup::Found(cached.clone());
             self.lookup_task = Task::ready(());
             cx.notify();
             return;
         }
-        self.pull_request = None;
+        self.state = BranchLookup::Loading;
         cx.notify();
 
         let client = GithubClient::new(key.0.clone());
@@ -106,12 +146,12 @@ impl PullRequestStatusItem {
                 match result {
                     Ok(Some(pull_request)) => {
                         this.cache.insert(key, pull_request.clone());
-                        this.pull_request = Some(pull_request);
+                        this.state = BranchLookup::Found(pull_request);
                     }
-                    Ok(None) => this.pull_request = None,
+                    Ok(None) => this.state = BranchLookup::NoPullRequest { branch: key.1 },
                     Err(error) => {
-                        this.pull_request = None;
                         this.log_lookup_error(&error);
+                        this.state = BranchLookup::Failed(error.to_string());
                     }
                 }
                 cx.notify();
@@ -128,12 +168,42 @@ impl PullRequestStatusItem {
     }
 }
 
+pub struct PullRequestStatusItem {
+    lookup: Entity<BranchPullRequestLookup>,
+    _subscription: Subscription,
+}
+
+impl PullRequestStatusItem {
+    pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
+        let lookup = BranchPullRequestLookup::shared(workspace.project(), cx);
+        let subscription = cx.observe(&lookup, |_, _, cx| cx.notify());
+        Self {
+            lookup,
+            _subscription: subscription,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_fixture(
+        workspace: &Workspace,
+        pull_request: BranchPullRequest,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let this = Self::new(workspace, cx);
+        this.lookup.update(cx, |lookup, cx| {
+            lookup.set_fixture(BranchLookup::Found(pull_request), cx)
+        });
+        this
+    }
+}
+
 impl Render for PullRequestStatusItem {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(pull_request) = &self.pull_request else {
+        let BranchLookup::Found(BranchPullRequest { number, .. }) = *self.lookup.read(cx).state()
+        else {
             return Empty.into_any_element();
         };
-        let label = format!("PR #{}", pull_request.number);
+        let label = format!("PR #{number}");
         Button::new("pull-request-status", label.clone())
             .style(ButtonStyle::Subtle)
             .label_size(LabelSize::Small)

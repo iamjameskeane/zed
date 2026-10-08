@@ -1,5 +1,6 @@
 pub mod github_api;
 pub mod pr_ask_ai;
+pub mod pr_changes_panel;
 pub mod pr_overview;
 pub mod pr_review;
 pub mod pr_status;
@@ -15,16 +16,20 @@ use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
-use github_api::{GithubClient, GithubContext, GithubError};
+use github_api::{BranchPullRequest, GithubClient, GithubContext, GithubError};
 use pr_overview::{PullRequestOverviewView, show_toast};
 
-pub use pr_status::PullRequestStatusItem;
+pub use pr_changes_panel::PullRequestChangesPanel;
+pub use pr_status::{BranchLookup, PullRequestStatusItem};
 
 actions!(
     pull_requests,
     [
-        /// Opens the pull request of the branch checked out in the active repository.
+        /// Opens the pull request of the branch checked out in the active repository
+        /// and shows its changed files in the Pull Request panel.
         OpenCurrentBranchPullRequest,
+        /// Toggles focus on the Pull Request panel.
+        TogglePullRequestPanel,
         /// Prompts for a pull request number and opens that pull request.
         OpenPullRequest,
         /// Prompts for a pull request number and checks that pull request out with `gh`.
@@ -43,6 +48,9 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenCurrentBranchPullRequest, window, cx| {
             open_current_branch_pull_request(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &TogglePullRequestPanel, window, cx| {
+            workspace.toggle_panel_focus::<PullRequestChangesPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &OpenPullRequest, window, cx| {
             prompt_for_pull_request_number(workspace, NumberPromptMode::Open, window, cx);
@@ -80,36 +88,36 @@ pub(crate) fn open_current_branch_pull_request(
                 .map(|context| context.repository),
         )
     };
-    let client = GithubClient::new(working_directory.clone());
+    workspace.focus_panel::<PullRequestChangesPanel>(window, cx);
 
+    let lookup = pr_status::BranchPullRequestLookup::shared(workspace.project(), cx);
+    if let BranchLookup::Found(pull_request) = lookup.read(cx).state().clone() {
+        open_overview(
+            workspace,
+            pull_request,
+            working_directory,
+            fallback_repository,
+            window,
+            cx,
+        );
+        return;
+    }
+
+    let client = GithubClient::new(working_directory.clone());
     cx.spawn_in(window, async move |_, cx| {
         let result = cx
             .background_spawn(async move { client.current_branch_pull_request().await })
             .await;
         workspace_handle
             .update_in(cx, |workspace, window, cx| match result {
-                Ok(Some(pull_request)) => {
-                    let Some(repository) = pull_request.repository().or(fallback_repository) else {
-                        show_toast(
-                            &workspace.weak_handle(),
-                            GithubError::NotGithubRepository.to_string(),
-                            false,
-                            cx,
-                        );
-                        return;
-                    };
-                    let context = GithubContext {
-                        repository,
-                        working_directory,
-                    };
-                    PullRequestOverviewView::open_with_context(
-                        workspace,
-                        context,
-                        pull_request.number,
-                        window,
-                        cx,
-                    );
-                }
+                Ok(Some(pull_request)) => open_overview(
+                    workspace,
+                    pull_request,
+                    working_directory,
+                    fallback_repository,
+                    window,
+                    cx,
+                ),
                 Ok(None) => {
                     let message = match branch_name {
                         Some(branch_name) => format!("No pull request for branch {branch_name}"),
@@ -124,6 +132,31 @@ pub(crate) fn open_current_branch_pull_request(
             .log_err();
     })
     .detach();
+}
+
+fn open_overview(
+    workspace: &mut Workspace,
+    pull_request: BranchPullRequest,
+    working_directory: std::path::PathBuf,
+    fallback_repository: Option<github_api::GithubRepository>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repository) = pull_request.repository().or(fallback_repository) else {
+        show_toast(
+            &workspace.weak_handle(),
+            GithubError::NotGithubRepository.to_string(),
+            false,
+            cx,
+        );
+        return;
+    };
+    let context = GithubContext {
+        repository,
+        working_directory,
+    };
+    PullRequestOverviewView::open_with_context(workspace, context, pull_request.number, window, cx);
+    workspace.focus_panel::<PullRequestChangesPanel>(window, cx);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
