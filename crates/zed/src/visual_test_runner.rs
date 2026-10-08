@@ -2455,9 +2455,11 @@ fn run_pull_request_visual_tests(
     update_baseline: bool,
 ) -> Result<TestResult> {
     use git_ui::pull_requests::{
+        PullRequestStatusItem,
         github_api::{
-            Actor, DiffSide, GithubContext, GithubRepository, Label, LatestReview,
-            PullRequestOverview, PullRequestState, ReviewComment, ReviewThread, TimelineItem,
+            Actor, BranchPullRequest, DiffSide, GithubContext, GithubRepository, Label,
+            LatestReview, PullRequestOverview, PullRequestState, ReviewComment, ReviewThread,
+            TimelineItem,
         },
         pr_overview::PullRequestOverviewView,
         pr_review::open_review_with_fixture,
@@ -2480,8 +2482,40 @@ fn run_pull_request_visual_tests(
     let created_at = "2026-10-06T09:30:00Z";
 
     let mut results = Vec::new();
-    let large = size(px(1100.0), px(720.0));
     let tall = size(px(1100.0), px(1000.0));
+
+    // pr_status_bar
+    let window = open_pull_request_fixture_window(
+        &app_state,
+        cx,
+        &project_path,
+        size(px(720.0), px(260.0)),
+    )?;
+    window.update(cx, |workspace, window, cx| {
+        let item = cx.new(|cx| {
+            PullRequestStatusItem::new_with_fixture(
+                workspace,
+                BranchPullRequest {
+                    number: 412,
+                    url: "https://github.com/octo-org/widgets/pull/412".into(),
+                    state: PullRequestState::Open,
+                },
+                cx,
+            )
+        });
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_left_item(item, window, cx)
+        });
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test(
+        "pr_status_bar",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
 
     // pr_overview
     let window = open_pull_request_fixture_window(&app_state, cx, &project_path, tall)?;
@@ -2546,6 +2580,7 @@ fn run_pull_request_visual_tests(
             },
         ],
     };
+    let overview_for_context = overview.clone();
     window.update(cx, |workspace, window, cx| {
         PullRequestOverviewView::open_with_fixture(
             workspace,
@@ -2556,7 +2591,12 @@ fn run_pull_request_visual_tests(
         );
     })?;
     settle(cx, window)?;
-    results.push(run_visual_test("pr_overview", window.into(), cx, update_baseline)?);
+    results.push(run_visual_test(
+        "pr_overview",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
     cx.update_window(window.into(), |_, window, _cx| window.remove_window())
         .log_err();
 
@@ -2687,6 +2727,59 @@ fn run_pull_request_visual_tests(
     settle(cx, window)?;
     results.push(run_visual_test(
         "pr_review_overlay",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+
+    // pr_ask_ai
+    let diff_output = std::process::Command::new("git")
+        .args(["diff", "main...HEAD"])
+        .current_dir(&project_path)
+        .output()?;
+    let context_text = git_ui::pull_requests::pr_ask_ai::build_context(
+        &overview_for_context,
+        &String::from_utf8_lossy(&diff_output.stdout),
+        &threads,
+        git_ui::pull_requests::pr_ask_ai::DIFF_BYTE_LIMIT,
+    );
+    let window = open_pull_request_fixture_window(
+        &app_state,
+        cx,
+        &project_path,
+        size(px(900.0), px(700.0)),
+    )?;
+    let (weak_workspace, async_window_cx) = window.update(cx, |workspace, window, cx| {
+        (workspace.weak_handle(), window.to_async(cx))
+    })?;
+    cx.background_executor.allow_parking();
+    let panel = cx
+        .foreground_executor
+        .block_test(agent_ui::AgentPanel::load(weak_workspace, async_window_cx))
+        .context("Failed to load AgentPanel")?;
+    cx.background_executor.forbid_parking();
+    window.update(cx, |workspace, window, cx| {
+        workspace.add_panel(panel.clone(), window, cx);
+        workspace.open_panel::<agent_ui::AgentPanel>(window, cx);
+    })?;
+    cx.run_until_parked();
+    let stub_agent: Rc<dyn AgentServer> = Rc::new(StubAgentServer::new(StubAgentConnection::new()));
+    cx.update_window(window.into(), |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.open_external_thread_with_server_and_content(
+                stub_agent.clone(),
+                Some(agent_ui::pull_request_initial_content(412, &context_text)),
+                window,
+                cx,
+            );
+        });
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test(
+        "pr_ask_ai",
         window.into(),
         cx,
         update_baseline,

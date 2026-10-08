@@ -69,6 +69,9 @@ pub enum MentionUri {
     MergeConflict {
         file_path: String,
     },
+    PullRequest {
+        number: u64,
+    },
     Skill {
         name: String,
         source: String,
@@ -239,6 +242,12 @@ impl MentionUri {
                 } else if path.starts_with("/agent/merge-conflict") {
                     let file_path = single_query_param(&url, "path")?.unwrap_or_default();
                     Ok(Self::MergeConflict { file_path })
+                } else if path.starts_with("/agent/pull-request") {
+                    let number = single_query_param(&url, "number")?
+                        .context("missing pull request number")?
+                        .parse::<u64>()
+                        .context("invalid pull request number")?;
+                    Ok(Self::PullRequest { number })
                 } else if path.starts_with("/agent/skill") {
                     let mut name = None;
                     let mut source = None;
@@ -328,7 +337,8 @@ impl MentionUri {
             | MentionUri::Fetch { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
-            | MentionUri::MergeConflict { .. } => None,
+            | MentionUri::MergeConflict { .. }
+            | MentionUri::PullRequest { .. } => None,
         }
     }
 
@@ -352,6 +362,7 @@ impl MentionUri {
                 }
             }
             MentionUri::GitDiff { base_ref } => format!("Branch Diff ({})", base_ref),
+            MentionUri::PullRequest { number } => format!("Pull Request #{number}"),
             MentionUri::MergeConflict { file_path } => {
                 let name = Path::new(file_path)
                     .file_name()
@@ -450,6 +461,7 @@ impl MentionUri {
             MentionUri::Fetch { .. } => IconName::ToolWeb.path().into(),
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
+            MentionUri::PullRequest { .. } => IconName::PullRequest.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
         }
     }
@@ -562,6 +574,12 @@ impl MentionUri {
             MentionUri::GitDiff { base_ref } => {
                 let mut url = Url::parse("zed:///agent/git-diff").unwrap();
                 url.query_pairs_mut().append_pair("base", base_ref);
+                url
+            }
+            MentionUri::PullRequest { number } => {
+                let mut url = Url::parse("zed:///agent/pull-request").unwrap();
+                url.query_pairs_mut()
+                    .append_pair("number", &number.to_string());
                 url
             }
             MentionUri::MergeConflict { file_path } => {
@@ -1333,6 +1351,15 @@ mod tests {
             _ => panic!("Expected Thread variant"),
         }
         assert_eq!(parsed.to_uri().to_string(), thread_uri);
+    }
+
+    #[test]
+    fn test_pull_request_uri_round_trips() {
+        let uri = MentionUri::PullRequest { number: 412 }.to_uri().to_string();
+        assert_eq!(uri, "zed:///agent/pull-request?number=412");
+        let parsed = MentionUri::parse(&uri, PathStyle::local()).unwrap();
+        assert_eq!(parsed, MentionUri::PullRequest { number: 412 });
+        assert_eq!(parsed.name(), "Pull Request #412");
     }
 
     #[test]

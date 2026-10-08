@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, AskAboutPullRequest, ConflictContent, LogoutAgent, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -573,6 +573,30 @@ pub fn init(cx: &mut App) {
                         );
                     });
                 })
+                .register_action(|workspace, action: &AskAboutPullRequest, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+
+                    let initial_content =
+                        pull_request_initial_content(action.number, &action.context);
+
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(initial_content),
+                            true,
+                            AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
                         let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -776,6 +800,26 @@ fn mention_path_for_terminal(
             .unwrap_or_else(|| abs_path.to_string_lossy().into_owned()),
         (Some(abs_path), None) => abs_path.to_string_lossy().into_owned(),
         (None, _) => project_path.path.display(path_style).into_owned(),
+    }
+}
+
+/// Prefills a new thread with a pull request as a context entry and an empty line
+/// for the user's question. It is never submitted automatically.
+pub fn pull_request_initial_content(number: u64, context: &str) -> AgentInitialContent {
+    let mention_uri = MentionUri::PullRequest { number };
+    AgentInitialContent::ContentBlock {
+        blocks: vec![
+            acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+                acp_v2::EmbeddedResourceResource::TextResourceContents(
+                    acp_v2::TextResourceContents::new(
+                        context.to_string(),
+                        mention_uri.to_uri().to_string(),
+                    ),
+                ),
+            )),
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new("\n\n".to_string())),
+        ],
+        auto_submit: false,
     }
 }
 
@@ -6746,6 +6790,17 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_external_thread_with_server_and_content(server, None, window, cx);
+    }
+
+    /// Like [`Self::open_external_thread_with_server`], prefilling the message editor.
+    pub fn open_external_thread_with_server_and_content(
+        &mut self,
+        server: Rc<dyn AgentServer>,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ext_agent = Agent::Custom {
             id: server.agent_id(),
         };
@@ -6756,7 +6811,7 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
+            initial_content,
             None,
             AgentThreadSource::AgentPanel,
             window,

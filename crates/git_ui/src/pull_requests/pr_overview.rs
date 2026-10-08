@@ -19,11 +19,11 @@ use util::{
 };
 use workspace::{Toast, Workspace, item::Item, notifications::NotificationId};
 
-use super::OpenPullRequestChanges;
 use super::github_api::{
     Actor, GithubClient, GithubContext, PullRequestOverview, PullRequestState, ReviewEvent,
     TimelineItem,
 };
+use super::pr_ask_ai::{ai_enabled, ask_ai_about_pull_request};
 use super::pr_review::{PullRequestReviewParams, PullRequestReviewSession};
 use crate::branch_diff::BranchDiff;
 
@@ -306,12 +306,13 @@ impl PullRequestOverviewView {
 
     fn open_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
-        window.dispatch_action(
-            Box::new(OpenPullRequestChanges {
-                number: self.number,
-            }),
-            cx,
-        );
+        let context = self.context.clone();
+        let number = self.number;
+        self.workspace
+            .update(cx, |workspace, cx| {
+                open_pull_request_changes_in(workspace, context, number, window, cx);
+            })
+            .log_err();
     }
 
     fn submit_review(&mut self, event: ReviewEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -435,6 +436,22 @@ impl PullRequestOverviewView {
                                 cx.listener(|this, _, window, cx| this.open_changes(window, cx)),
                             ),
                     )
+                    .when(ai_enabled(cx), |this| {
+                        this.child(
+                            Button::new("pull-request-overview-ask-ai", "Ask AI")
+                                .style(ButtonStyle::Filled)
+                                .start_icon(Icon::new(IconName::ZedAssistant).size(IconSize::Small))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    ask_ai_about_pull_request(
+                                        this.workspace.clone(),
+                                        this.context.clone(),
+                                        this.number,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("pull-request-overview-github", "Open on GitHub")
                             .style(ButtonStyle::Subtle)
@@ -772,18 +789,24 @@ pub fn open_pull_request_changes(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    match github_context(workspace.project(), cx) {
+        Ok(context) => open_pull_request_changes_in(workspace, context, number, window, cx),
+        Err(message) => show_toast(&workspace.weak_handle(), message, false, cx),
+    }
+}
+
+pub fn open_pull_request_changes_in(
+    workspace: &mut Workspace,
+    context: GithubContext,
+    number: u64,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let workspace_handle = workspace.weak_handle();
     let project = workspace.project().clone();
     let Some(repository) = project.read(cx).git_store().read(cx).active_repository() else {
         show_toast(&workspace_handle, "No active repository".into(), false, cx);
         return;
-    };
-    let context = match GithubContext::from_repository(repository.read(cx), cx) {
-        Ok(context) => context,
-        Err(error) => {
-            show_toast(&workspace_handle, error.to_string(), false, cx);
-            return;
-        }
     };
     let current_branch = repository
         .read(cx)
@@ -834,6 +857,7 @@ pub fn open_pull_request_changes(
                                         repository: session_repository,
                                         context,
                                         number,
+                                        title: overview.title.into(),
                                         pull_request_id: overview.id,
                                         head_oid: overview.head_ref_oid,
                                     },
@@ -858,7 +882,10 @@ pub fn open_pull_request_changes(
     .detach();
 }
 
-async fn fetch_base_ref(working_directory: &Path, base_ref_name: &str) -> anyhow::Result<()> {
+pub(super) async fn fetch_base_ref(
+    working_directory: &Path,
+    base_ref_name: &str,
+) -> anyhow::Result<()> {
     let output = new_command("git")
         .args(["fetch", "origin", base_ref_name])
         .current_dir(working_directory)
