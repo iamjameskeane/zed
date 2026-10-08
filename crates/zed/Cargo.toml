@@ -52,6 +52,7 @@ visual-tests = [
     "fs/test-support",
     "recent_projects/test-support",
     "title_bar/test-support",
+    "git_ui/test-support",
 ]
 
 [[bin]]

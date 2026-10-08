@@ -247,6 +247,11 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     // Run until all initialization tasks complete
     cx.run_until_parked();
 
+    if std::env::var("VISUAL_TEST_ONLY").as_deref() == Ok("pull_requests") {
+        run_pull_request_visual_tests(app_state, &mut cx, update_baseline)?;
+        return Ok(());
+    }
+
     // Open workspace window
     let window_size = size(px(1280.0), px(800.0));
     let bounds = Bounds {
@@ -621,6 +626,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
         Err(e) => {
             eprintln!("✗ settings_ui_subpage_auto_open: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
+    // Run PR review visual tests
+    println!("\n--- pull_request views ---");
+    match run_pull_request_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ pull_request views: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ pull_request views: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ pull_request views: FAILED - {}", e);
             failed += 1;
         }
     }
@@ -2303,6 +2325,488 @@ fn run_agent_thread_view_test(
             Ok(TestResult::BaselineUpdated(p.clone()))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn pull_request_fixture_repository() -> Result<PathBuf> {
+    let temp_dir = tempfile::tempdir()?;
+    let project_path = temp_dir.keep().canonicalize()?.join("widgets");
+    std::fs::create_dir_all(project_path.join("src"))?;
+    let git = |args: &[&str]| -> Result<()> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_path)
+            .output()?;
+        anyhow::ensure!(output.status.success(), "git {args:?} failed");
+        Ok(())
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "octocat@example.com"])?;
+    git(&["config", "user.name", "octocat"])?;
+    std::fs::write(
+        project_path.join("src/lib.rs"),
+        "use std::time::Duration;\n\npub struct Client {\n    pub endpoint: String,\n    pub timeout: Duration,\n}\n\nimpl Client {\n    pub fn new(endpoint: String) -> Self {\n        Self { endpoint, timeout: Duration::from_secs(5) }\n    }\n\n    pub fn fetch(&self, path: &str) -> Result<String, String> {\n        let url = format!(\"{}/{}\", self.endpoint, path);\n        send(&url)\n    }\n}\n",
+    )?;
+    git(&["add", "."])?;
+    git(&["commit", "-m", "Initial commit"])?;
+    git(&["checkout", "-b", "octocat/retry-logic"])?;
+    std::fs::write(
+        project_path.join("src/lib.rs"),
+        "use std::time::Duration;\n\npub struct Client {\n    pub endpoint: String,\n    pub timeout: Duration,\n    pub max_retries: u32,\n}\n\nimpl Client {\n    pub fn new(endpoint: String) -> Self {\n        Self { endpoint, timeout: Duration::from_secs(5), max_retries: 3 }\n    }\n\n    pub fn fetch(&self, path: &str) -> Result<String, String> {\n        let url = format!(\"{}/{}\", self.endpoint, path);\n        let mut attempts = 0;\n        loop {\n            match send(&url) {\n                Ok(body) => return Ok(body),\n                Err(error) if attempts >= self.max_retries => return Err(error),\n                Err(_) => attempts += 1,\n            }\n        }\n    }\n}\n",
+    )?;
+    std::fs::write(
+        project_path.join("src/backoff.rs"),
+        "pub fn delay_for(attempt: u32) -> u64 {\n    100 * 2u64.pow(attempt)\n}\n",
+    )?;
+    git(&["add", "."])?;
+    git(&["commit", "-m", "Retry failed requests"])?;
+    Ok(project_path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_pull_request_fixture_window(
+    app_state: &Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    project_path: &Path,
+    window_size: gpui::Size<gpui::Pixels>,
+) -> Result<WindowHandle<Workspace>> {
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let add_worktree_task = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .log_err();
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+    for _ in 0..5 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+    let window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: window_size,
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open pull request test window")?;
+    cx.run_until_parked();
+    Ok(window)
+}
+
+#[cfg(target_os = "macos")]
+fn settle(cx: &mut VisualTestAppContext, window: WindowHandle<Workspace>) -> Result<()> {
+    for _ in 0..8 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+    cx.update_window(window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn merge_results(results: Vec<TestResult>) -> TestResult {
+    results
+        .into_iter()
+        .reduce(|left, right| match (left, right) {
+            (TestResult::Passed, TestResult::Passed) => TestResult::Passed,
+            (TestResult::BaselineUpdated(path), _) | (_, TestResult::BaselineUpdated(path)) => {
+                TestResult::BaselineUpdated(path)
+            }
+        })
+        .unwrap_or(TestResult::Passed)
+}
+
+/// Visual tests for the native GitHub pull request panel, overview tab, inline
+/// review threads and the gutter comment overlay, all rendered from fixtures.
+#[cfg(target_os = "macos")]
+fn run_pull_request_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    use git_ui::pull_requests::{
+        github_api::{
+            Actor, DiffSide, FileChangeType, GithubContext, GithubRepository, Label, LatestReview,
+            PullRequestFile, PullRequestList, PullRequestListKind, PullRequestOverview,
+            PullRequestState, PullRequestSummary, ReviewComment, ReviewThread, TimelineItem,
+            ViewedState,
+        },
+        pr_overview::PullRequestOverviewView,
+        pr_panel::PullRequestPanel,
+        pr_review::open_review_with_fixture,
+    };
+
+    let project_path = pull_request_fixture_repository()?;
+    let context = GithubContext {
+        repository: GithubRepository {
+            owner: "octo-org".into(),
+            name: "widgets".into(),
+        },
+        working_directory: project_path.clone(),
+    };
+    let actor = |login: &str| {
+        Some(Actor {
+            login: login.into(),
+            avatar_url: None,
+        })
+    };
+    let summary = |number: u64, title: &str, author: &str, is_draft: bool, head: &str| {
+        PullRequestSummary {
+            id: format!("PR_{number}"),
+            number,
+            title: title.into(),
+            url: format!("https://github.com/octo-org/widgets/pull/{number}"),
+            is_draft,
+            author: actor(author),
+            head_ref_name: head.into(),
+            base_ref_name: "main".into(),
+        }
+    };
+    let list = |pull_requests: Vec<PullRequestSummary>| PullRequestList {
+        total_count: pull_requests.len() as u64,
+        pull_requests,
+    };
+    let created_at = "2026-10-06T09:30:00Z";
+
+    let mut results = Vec::new();
+    let large = size(px(1100.0), px(720.0));
+    let tall = size(px(1100.0), px(1000.0));
+
+    // pr_panel
+    let retry = summary(
+        412,
+        "Retry failed requests with exponential backoff",
+        "octocat",
+        false,
+        "octocat/retry-logic",
+    );
+    let window = open_pull_request_fixture_window(&app_state, cx, &project_path, large)?;
+    let files = vec![
+        PullRequestFile {
+            path: "src/client/lib.rs".into(),
+            additions: 24,
+            deletions: 3,
+            change_type: FileChangeType::Modified,
+            viewer_viewed_state: ViewedState::Viewed,
+        },
+        PullRequestFile {
+            path: "src/client/backoff.rs".into(),
+            additions: 41,
+            deletions: 0,
+            change_type: FileChangeType::Added,
+            viewer_viewed_state: ViewedState::Unviewed,
+        },
+        PullRequestFile {
+            path: "src/legacy_retry.rs".into(),
+            additions: 0,
+            deletions: 57,
+            change_type: FileChangeType::Deleted,
+            viewer_viewed_state: ViewedState::Unviewed,
+        },
+    ];
+    window.update(cx, |workspace, window, cx| {
+        let lists = vec![
+            (
+                PullRequestListKind::WaitingForMyReview,
+                list(vec![
+                    retry.clone(),
+                    summary(
+                        409,
+                        "Add pagination to the widget list endpoint",
+                        "reviewer-a",
+                        false,
+                        "reviewer-a/pagination",
+                    ),
+                ]),
+            ),
+            (
+                PullRequestListKind::CreatedByMe,
+                list(vec![summary(
+                    415,
+                    "Draft: rework the connection pool",
+                    "me",
+                    true,
+                    "me/pool",
+                )]),
+            ),
+            (
+                PullRequestListKind::AllOpen,
+                list(vec![
+                    retry.clone(),
+                    summary(
+                        409,
+                        "Add pagination to the widget list endpoint",
+                        "reviewer-a",
+                        false,
+                        "reviewer-a/pagination",
+                    ),
+                    summary(
+                        401,
+                        "Bump serde to the latest minor release",
+                        "dependabot-bot",
+                        false,
+                        "deps/serde",
+                    ),
+                ]),
+            ),
+        ];
+        let panel = PullRequestPanel::new_with_fixture(
+            workspace,
+            lists,
+            vec![(retry.clone(), files)],
+            window,
+            cx,
+        );
+        workspace.add_panel(panel, window, cx);
+        workspace.open_panel::<PullRequestPanel>(window, cx);
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test("pr_panel", window.into(), cx, update_baseline)?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+
+    // pr_overview
+    let window = open_pull_request_fixture_window(&app_state, cx, &project_path, tall)?;
+    let overview = PullRequestOverview {
+        id: "PR_412".into(),
+        number: 412,
+        title: "Retry failed requests with exponential backoff".into(),
+        body: "## Summary\n\nRetry transient failures in `Client::fetch` instead of returning the first error.\n\n- Adds a `max_retries` setting (default 3)\n- Adds `backoff::delay_for` for the wait between attempts\n- Removes the unused `legacy_retry` module\n\nRun `cargo test -p widgets` to verify.".into(),
+        state: PullRequestState::Open,
+        is_draft: false,
+        url: "https://github.com/octo-org/widgets/pull/412".into(),
+        author: actor("octocat"),
+        head_ref_name: "octocat/retry-logic".into(),
+        base_ref_name: "main".into(),
+        head_ref_oid: "0000000".into(),
+        base_ref_oid: "1111111".into(),
+        review_requests: vec!["reviewer-b".into()],
+        latest_reviews: vec![
+            LatestReview {
+                author: actor("reviewer-a"),
+                state: "CHANGES_REQUESTED".into(),
+            },
+            LatestReview {
+                author: actor("reviewer-c"),
+                state: "APPROVED".into(),
+            },
+        ],
+        labels: vec![
+            Label {
+                name: "enhancement".into(),
+                color: "a2eeef".into(),
+            },
+            Label {
+                name: "needs-docs".into(),
+                color: "d93f0b".into(),
+            },
+        ],
+        check_state: Some("FAILURE".into()),
+        timeline: vec![
+            TimelineItem::IssueComment {
+                id: "c1".into(),
+                author: actor("octocat"),
+                body: "Rebased on `main`. CI is red because of an unrelated flaky test.".into(),
+                created_at: created_at.into(),
+                url: String::new(),
+            },
+            TimelineItem::PullRequestReview {
+                id: "r1".into(),
+                author: actor("reviewer-a"),
+                body: "Please cap the delay. `100 * 2^attempt` overflows for large attempt counts.".into(),
+                state: "CHANGES_REQUESTED".into(),
+                created_at: created_at.into(),
+                url: String::new(),
+            },
+            TimelineItem::PullRequestReview {
+                id: "r2".into(),
+                author: actor("reviewer-c"),
+                body: String::new(),
+                state: "APPROVED".into(),
+                created_at: created_at.into(),
+                url: String::new(),
+            },
+        ],
+    };
+    window.update(cx, |workspace, window, cx| {
+        PullRequestOverviewView::open_with_fixture(
+            workspace,
+            context.clone(),
+            overview,
+            window,
+            cx,
+        );
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test("pr_overview", window.into(), cx, update_baseline)?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+
+    // pr_review_threads and pr_review_overlay
+    let comment = |id: &str, author: &str, body: &str, state: &str| ReviewComment {
+        id: id.into(),
+        author: actor(author),
+        body: body.into(),
+        created_at: created_at.into(),
+        state: state.into(),
+    };
+    let thread = |id: &str,
+                  resolved: bool,
+                  outdated: bool,
+                  line: Option<u32>,
+                  original_line: u32,
+                  comments: Vec<ReviewComment>| ReviewThread {
+        id: id.into(),
+        is_resolved: resolved,
+        is_outdated: outdated,
+        path: "src/lib.rs".into(),
+        diff_side: Some(DiffSide::Right),
+        line,
+        start_line: None,
+        original_line: Some(original_line),
+        subject_type: Some("LINE".into()),
+        viewer_can_reply: true,
+        viewer_can_resolve: true,
+        comments,
+    };
+    let threads = vec![
+        thread(
+            "t1",
+            false,
+            false,
+            Some(20),
+            20,
+            vec![
+                comment(
+                    "tc1",
+                    "reviewer-a",
+                    "Should this compare with `>` instead? As written we make `max_retries + 1` attempts.",
+                    "SUBMITTED",
+                ),
+                comment(
+                    "tc2",
+                    "octocat",
+                    "That is intended: the first call is not a retry. I will rename the field to make that clear.",
+                    "PENDING",
+                ),
+            ],
+        ),
+        thread(
+            "t2",
+            true,
+            false,
+            Some(11),
+            11,
+            vec![comment(
+                "tc3",
+                "reviewer-b",
+                "Three is a reasonable default.",
+                "SUBMITTED",
+            )],
+        ),
+        thread(
+            "t3",
+            false,
+            true,
+            None,
+            16,
+            vec![comment(
+                "tc4",
+                "reviewer-a",
+                "Consider a `u8` counter here.",
+                "SUBMITTED",
+            )],
+        ),
+    ];
+    let window = open_pull_request_fixture_window(&app_state, cx, &project_path, tall)?;
+    window.update(cx, |workspace, window, cx| {
+        let Some(repository) = workspace
+            .project()
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .active_repository()
+        else {
+            return;
+        };
+        open_review_with_fixture(
+            workspace,
+            repository,
+            "main".into(),
+            context.clone(),
+            threads.clone(),
+            Some("PRR_pending".into()),
+            window,
+            cx,
+        );
+    })?;
+    cx.background_executor.allow_parking();
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(100));
+        cx.advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+    }
+    cx.background_executor.forbid_parking();
+    settle(cx, window)?;
+    results.push(run_visual_test(
+        "pr_review_threads",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    window.update(cx, |workspace, window, cx| {
+        if let Some(editor) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<editor::Editor>(cx))
+        {
+            editor.update(cx, |editor, cx| {
+                editor.show_diff_review_overlay(DisplayRow(14)..DisplayRow(14), window, cx);
+            });
+        }
+    })?;
+    settle(cx, window)?;
+    results.push(run_visual_test(
+        "pr_review_overlay",
+        window.into(),
+        cx,
+        update_baseline,
+    )?);
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
+        .log_err();
+    cx.run_until_parked();
+
+    Ok(merge_results(results))
 }
 
 /// Visual test for the Tool Permissions Settings UI page

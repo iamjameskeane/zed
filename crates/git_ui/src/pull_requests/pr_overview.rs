@@ -102,7 +102,11 @@ impl PullRequestOverviewView {
             workspace.activate_item(&existing, true, true, window, cx);
             return;
         }
-        let view = cx.new(|cx| Self::new(workspace_handle, project, context, number, window, cx));
+        let view = cx.new(|cx| {
+            let mut view = Self::new(workspace_handle, project, context, number, window, cx);
+            view.load(cx);
+            view
+        });
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
@@ -119,7 +123,7 @@ impl PullRequestOverviewView {
             editor.set_placeholder_text("Leave a review comment", window, cx);
             editor
         });
-        let mut this = Self {
+        Self {
             workspace,
             project,
             context,
@@ -131,9 +135,33 @@ impl PullRequestOverviewView {
             checking_out: false,
             load_task: Task::ready(()),
             submit_task: Task::ready(()),
-        };
-        this.load(cx);
-        this
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_with_fixture(
+        workspace: &mut Workspace,
+        context: GithubContext,
+        overview: PullRequestOverview,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        let view = cx.new(|cx| {
+            let mut view = Self::new(
+                workspace_handle,
+                project,
+                context,
+                overview.number,
+                window,
+                cx,
+            );
+            let loaded = view.build_loaded(overview, cx);
+            view.state = LoadState::Loaded(Box::new(loaded));
+            view
+        });
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
     pub fn open_and_focus_review_box(
@@ -991,7 +1019,20 @@ pub(super) fn avatar(actor: Option<&Actor>) -> gpui::AnyElement {
         Some(url) => Avatar::new(SharedString::from(url))
             .size(px(20.))
             .into_any_element(),
-        None => div().size(px(20.)).into_any_element(),
+        None => {
+            let initial = actor
+                .and_then(|actor| actor.login.chars().next())
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_default();
+            h_flex()
+                .size(px(20.))
+                .flex_none()
+                .justify_center()
+                .rounded_full()
+                .bg(gpui::hsla(0., 0., 0.5, 0.3))
+                .child(Label::new(initial).size(LabelSize::XSmall))
+                .into_any_element()
+        }
     }
 }
 

@@ -606,6 +606,48 @@ pub struct PullRequestReviewSession {
     _splittable_subscription: Subscription,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn open_review_with_fixture(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    base_ref: SharedString,
+    context: GithubContext,
+    threads: Vec<ReviewThread>,
+    pending_review_id: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+    let params = PullRequestReviewParams {
+        workspace: workspace.weak_handle(),
+        project: project.clone(),
+        repository: repository.clone(),
+        context,
+        number: 1,
+        pull_request_id: "fixture".into(),
+        head_oid: "fixture".into(),
+    };
+    BranchDiff::deploy_branch_diff_with_base_ref_then(
+        workspace,
+        project,
+        repository,
+        base_ref,
+        None,
+        window,
+        cx,
+        move |branch_diff, window, cx| {
+            PullRequestReviewSession::attach_with_fixture(
+                &branch_diff,
+                params,
+                threads,
+                pending_review_id,
+                window,
+                cx,
+            );
+        },
+    );
+}
+
 struct SessionReviewHandler {
     session: WeakEntity<PullRequestReviewSession>,
 }
@@ -651,7 +693,11 @@ impl PullRequestReviewSession {
             return;
         }
         let splittable = branch_diff.read(cx).editor(cx);
-        let session = cx.new(|cx| Self::new(params, splittable, window, cx));
+        let session = cx.new(|cx| {
+            let mut session = Self::new(params, splittable, cx);
+            session.refresh(window, cx);
+            session
+        });
         branch_diff.update(cx, |branch_diff, cx| {
             branch_diff.set_pull_request_review(session, cx);
         });
@@ -660,7 +706,6 @@ impl PullRequestReviewSession {
     fn new(
         params: PullRequestReviewParams,
         splittable: Entity<SplittableEditor>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscription = cx.observe(&splittable, |this, _, cx| this.sync_editors(cx));
@@ -684,8 +729,27 @@ impl PullRequestReviewSession {
             _splittable_subscription: subscription,
         };
         this.sync_editors(cx);
-        this.refresh(window, cx);
         this
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attach_with_fixture(
+        branch_diff: &Entity<BranchDiff>,
+        params: PullRequestReviewParams,
+        threads: Vec<ReviewThread>,
+        pending_review_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let splittable = branch_diff.read(cx).editor(cx);
+        let session = cx.new(|cx| {
+            let mut session = Self::new(params, splittable, cx);
+            session.apply(threads, pending_review_id, window, cx);
+            session
+        });
+        branch_diff.update(cx, |branch_diff, cx| {
+            branch_diff.set_pull_request_review(session, cx);
+        });
     }
 
     fn client(&self) -> GithubClient {
