@@ -137,6 +137,40 @@ pub enum PullRequestState {
     Merged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FileChangeType {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    Copied,
+    Changed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FileChangeType {
+    pub fn letter(self) -> &'static str {
+        match self {
+            FileChangeType::Added => "A",
+            FileChangeType::Deleted => "D",
+            FileChangeType::Renamed => "R",
+            FileChangeType::Copied => "C",
+            FileChangeType::Modified | FileChangeType::Changed | FileChangeType::Unknown => "M",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PullRequestFile {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+    #[serde(rename = "changeType")]
+    pub change_type: FileChangeType,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BranchPullRequest {
     pub number: u64,
@@ -287,6 +321,8 @@ where
     Ok(Connection::<T>::deserialize(deserializer)?.nodes)
 }
 
+const MAX_FILE_PAGES: usize = 30;
+
 const THREAD_FIELDS: &str = "id isResolved isOutdated path diffSide line startLine originalLine \
      subjectType viewerCanReply viewerCanResolve \
      comments(first: 50) { nodes { id author { login avatarUrl } body createdAt state } }";
@@ -366,6 +402,39 @@ impl GithubClient {
             GithubError::InvalidResponse(format!("pull request #{number} not found"))
         })?;
         Ok(raw.into_overview())
+    }
+
+    pub async fn fetch_files(
+        &self,
+        repository: &GithubRepository,
+        number: u64,
+    ) -> Result<Vec<PullRequestFile>, GithubError> {
+        let query = "query($owner: String!, $name: String!, $number: Int!, $cursor: String) { \
+            repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+            files(first: 100, after: $cursor) { nodes { path additions deletions changeType } \
+            pageInfo { hasNextPage endCursor } } } } }";
+        let mut files = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_FILE_PAGES {
+            let mut variables = repository_variables(repository, number);
+            if let Some(cursor) = &cursor {
+                variables.push(("cursor", Variable::text(cursor)));
+            }
+            let response: FilesResponse = self.graphql(query, variables).await?;
+            let page = response
+                .repository
+                .pull_request
+                .ok_or_else(|| {
+                    GithubError::InvalidResponse(format!("pull request #{number} not found"))
+                })?
+                .files;
+            files.extend(page.nodes);
+            match page.page_info.end_cursor {
+                Some(end_cursor) if page.page_info.has_next_page => cursor = Some(end_cursor),
+                _ => break,
+            }
+        }
+        Ok(files)
     }
 
     pub async fn fetch_review_threads(
@@ -689,6 +758,27 @@ struct PullRequestEnvelope<T> {
 type ThreadsResponse = RepositoryEnvelope<ThreadsNode>;
 type PendingReviewsResponse = RepositoryEnvelope<ReviewsNode>;
 type OverviewResponse = RepositoryEnvelope<RawOverview>;
+type FilesResponse = RepositoryEnvelope<FilesNode>;
+
+#[derive(Deserialize)]
+struct FilesNode {
+    files: FilesPage,
+}
+
+#[derive(Deserialize)]
+struct FilesPage {
+    nodes: Vec<PullRequestFile>,
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize)]
+struct PageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -911,6 +1001,24 @@ mod tests {
         assert_eq!(threads[0].original_line, Some(7));
         assert!(threads[0].is_outdated);
         assert_eq!(threads[0].comments[0].state, "PENDING");
+    }
+
+    #[test]
+    fn parses_files_page_with_cursor() {
+        let json = r#"{"data":{"repository":{"pullRequest":{"files":{
+            "nodes":[
+                {"path":"src/a.rs","additions":3,"deletions":1,"changeType":"MODIFIED"},
+                {"path":"src/b.rs","additions":9,"deletions":0,"changeType":"ADDED"},
+                {"path":"src/c.rs","additions":0,"deletions":4,"changeType":"FUTURE_KIND"}],
+            "pageInfo":{"hasNextPage":true,"endCursor":"Y3Vyc29y"}}}}}}"#;
+        let response: FilesResponse = parse_graphql_response(json).unwrap();
+        let page = response.repository.pull_request.unwrap().files;
+        assert_eq!(page.nodes.len(), 3);
+        assert_eq!(page.nodes[1].change_type, FileChangeType::Added);
+        assert_eq!(page.nodes[2].change_type, FileChangeType::Unknown);
+        assert_eq!(page.nodes[2].change_type.letter(), "M");
+        assert!(page.page_info.has_next_page);
+        assert_eq!(page.page_info.end_cursor.as_deref(), Some("Y3Vyc29y"));
     }
 
     #[test]

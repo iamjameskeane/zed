@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use editor::{Editor, hover_markdown_style};
+use git::repository::RepoPath;
 use gpui::{
     AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, SharedString, Task, WeakEntity, Window, px,
@@ -802,6 +803,22 @@ pub fn open_pull_request_changes_in(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    open_pull_request_changes_at(workspace, context, number, None, window, cx);
+}
+
+/// Opens the pull request diff for `number` and scrolls it to `file_path`, a
+/// path relative to the repository root.
+pub(super) fn open_pull_request_changes_at(
+    workspace: &mut Workspace,
+    context: GithubContext,
+    number: u64,
+    file_path: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if scroll_open_pull_request_changes(workspace, number, file_path.as_deref(), window, cx) {
+        return;
+    }
     let workspace_handle = workspace.weak_handle();
     let project = workspace.project().clone();
     let Some(repository) = project.read(cx).git_store().read(cx).active_repository() else {
@@ -849,6 +866,13 @@ pub fn open_pull_request_changes_in(
                             window,
                             cx,
                             move |branch_diff, window, cx| {
+                                if let Some(repo_path) =
+                                    file_path.and_then(|path| RepoPath::new(&path).log_err())
+                                {
+                                    branch_diff.update(cx, |branch_diff, cx| {
+                                        branch_diff.move_to_repo_path(repo_path, window, cx)
+                                    });
+                                }
                                 PullRequestReviewSession::attach(
                                     &branch_diff,
                                     PullRequestReviewParams {
@@ -880,6 +904,29 @@ pub fn open_pull_request_changes_in(
         }
     })
     .detach();
+}
+
+fn scroll_open_pull_request_changes(
+    workspace: &mut Workspace,
+    number: u64,
+    file_path: Option<&str>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(branch_diff) = workspace.items_of_type::<BranchDiff>(cx).find(|item| {
+        item.read(cx)
+            .pull_request_review()
+            .is_some_and(|session| session.read(cx).number() == number)
+    }) else {
+        return false;
+    };
+    workspace.activate_item(&branch_diff, true, true, window, cx);
+    if let Some(repo_path) = file_path.and_then(|path| RepoPath::new(path).log_err()) {
+        branch_diff.update(cx, |branch_diff, cx| {
+            branch_diff.move_to_repo_path(repo_path, window, cx)
+        });
+    }
+    true
 }
 
 pub(super) async fn fetch_base_ref(
@@ -978,7 +1025,7 @@ pub(super) fn format_relative_time(timestamp: &str, now: OffsetDateTime) -> Stri
     }
 }
 
-fn state_badge(overview: &PullRequestOverview) -> (&'static str, Color) {
+pub(super) fn state_badge(overview: &PullRequestOverview) -> (&'static str, Color) {
     match overview.state {
         PullRequestState::Merged => ("Merged", Color::Accent),
         PullRequestState::Closed => ("Closed", Color::Error),
