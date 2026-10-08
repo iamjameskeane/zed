@@ -1,6 +1,7 @@
 pub mod github_api;
 pub mod pr_overview;
 pub mod pr_panel;
+pub mod pr_review;
 
 use gpui::{App, actions};
 use schemars::JsonSchema;
