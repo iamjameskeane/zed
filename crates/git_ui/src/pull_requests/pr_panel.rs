@@ -121,6 +121,36 @@ impl PullRequestPanel {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_fixture(
+        workspace: &mut Workspace,
+        lists: Vec<(PullRequestListKind, PullRequestList)>,
+        expanded: Vec<(PullRequestSummary, Vec<PullRequestFile>)>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let panel = Self::new(workspace, window, cx);
+        panel.update(cx, |panel, _| {
+            panel.has_refreshed = true;
+            for (kind, list) in lists {
+                if let Some(section) = panel.sections.iter_mut().find(|s| s.kind == kind) {
+                    section.state = LoadState::Loaded(list);
+                }
+            }
+            for (summary, files) in expanded {
+                panel.expanded.insert(
+                    summary.number,
+                    ExpandedPullRequest {
+                        pull_request_id: summary.id,
+                        files: LoadState::Loaded(files),
+                        _task: Task::ready(()),
+                    },
+                );
+            }
+        });
+        panel
+    }
+
     fn github_context(&self, cx: &App) -> Result<GithubContext, GithubError> {
         let repository = self
             .project
@@ -551,6 +581,7 @@ impl PullRequestPanel {
                 ListItem::new(("pull-request", number as usize))
                     .indent_level(1)
                     .toggle(expanded.is_some())
+                    .always_show_disclosure_icon(true)
                     .on_toggle(cx.listener(move |this, _, _, cx| {
                         this.toggle_pull_request(&toggle_target, cx);
                     }))
