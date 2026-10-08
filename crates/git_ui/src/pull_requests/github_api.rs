@@ -14,6 +14,7 @@ pub enum GithubError {
     GhNotInstalled,
     NotAuthenticated(String),
     NotGithubRepository,
+    NoPullRequest,
     Graphql(Vec<String>),
     CommandFailed(String),
     InvalidResponse(String),
@@ -31,6 +32,7 @@ impl fmt::Display for GithubError {
                 "The GitHub CLI is not authenticated. Run `gh auth login`. {details}"
             ),
             GithubError::NotGithubRepository => write!(formatter, "Not a GitHub repository"),
+            GithubError::NoPullRequest => write!(formatter, "No pull request for this branch"),
             GithubError::Graphql(messages) => {
                 write!(formatter, "GitHub error: {}", messages.join("; "))
             }
@@ -94,37 +96,6 @@ impl Variable {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PullRequestListKind {
-    WaitingForMyReview,
-    CreatedByMe,
-    AllOpen,
-}
-
-impl PullRequestListKind {
-    pub const ALL: [PullRequestListKind; 3] = [
-        PullRequestListKind::WaitingForMyReview,
-        PullRequestListKind::CreatedByMe,
-        PullRequestListKind::AllOpen,
-    ];
-
-    pub fn title(self) -> &'static str {
-        match self {
-            PullRequestListKind::WaitingForMyReview => "Waiting For My Review",
-            PullRequestListKind::CreatedByMe => "Created By Me",
-            PullRequestListKind::AllOpen => "All Open",
-        }
-    }
-
-    fn search_qualifiers(self) -> &'static str {
-        match self {
-            PullRequestListKind::WaitingForMyReview => "is:open review-requested:@me",
-            PullRequestListKind::CreatedByMe => "is:open author:@me",
-            PullRequestListKind::AllOpen => "is:open",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DiffSide {
@@ -166,39 +137,24 @@ pub enum PullRequestState {
     Merged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FileChangeType {
-    Added,
-    Deleted,
-    Modified,
-    Renamed,
-    Copied,
-    Changed,
-    #[serde(other)]
-    Unknown,
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BranchPullRequest {
+    pub number: u64,
+    pub url: String,
+    pub state: PullRequestState,
 }
 
-impl FileChangeType {
-    pub fn letter(self) -> &'static str {
-        match self {
-            FileChangeType::Added => "A",
-            FileChangeType::Deleted => "D",
-            FileChangeType::Renamed => "R",
-            FileChangeType::Copied => "C",
-            FileChangeType::Modified | FileChangeType::Changed | FileChangeType::Unknown => "M",
-        }
+impl BranchPullRequest {
+    pub fn repository(&self) -> Option<GithubRepository> {
+        let path = self.url.split_once("://")?.1;
+        let mut segments = path.split('/').skip(1);
+        let owner = segments.next().filter(|segment| !segment.is_empty())?;
+        let name = segments.next().filter(|segment| !segment.is_empty())?;
+        Some(GithubRepository {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ViewedState {
-    Dismissed,
-    Unviewed,
-    Viewed,
-    #[serde(other)]
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -212,35 +168,6 @@ pub struct Actor {
 struct Connection<T> {
     #[serde(default = "Vec::new")]
     nodes: Vec<T>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PullRequestSummary {
-    pub id: String,
-    pub number: u64,
-    pub title: String,
-    pub url: String,
-    pub is_draft: bool,
-    pub author: Option<Actor>,
-    pub head_ref_name: String,
-    pub base_ref_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PullRequestList {
-    pub total_count: u64,
-    pub pull_requests: Vec<PullRequestSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PullRequestFile {
-    pub path: String,
-    pub additions: u32,
-    pub deletions: u32,
-    pub change_type: FileChangeType,
-    pub viewer_viewed_state: ViewedState,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -360,9 +287,6 @@ where
     Ok(Connection::<T>::deserialize(deserializer)?.nodes)
 }
 
-const SUMMARY_FIELDS: &str =
-    "id number title url isDraft headRefName baseRefName author { login avatarUrl }";
-
 const THREAD_FIELDS: &str = "id isResolved isOutdated path diffSide line startLine originalLine \
      subjectType viewerCanReply viewerCanResolve \
      comments(first: 50) { nodes { id author { login avatarUrl } body createdAt state } }";
@@ -388,6 +312,17 @@ impl GithubClient {
             .map_err(|error| GithubError::InvalidResponse(error.to_string()))
     }
 
+    pub async fn current_branch_pull_request(
+        &self,
+    ) -> Result<Option<BranchPullRequest>, GithubError> {
+        let output = run_gh(
+            &self.working_directory,
+            &["pr", "view", "--json", "number,url,state"],
+        )
+        .await;
+        parse_branch_pull_request(output)
+    }
+
     pub async fn checkout_pull_request(&self, number: u64) -> Result<(), GithubError> {
         run_gh(
             &self.working_directory,
@@ -395,29 +330,6 @@ impl GithubClient {
         )
         .await
         .map(drop)
-    }
-
-    pub async fn list_pull_requests(
-        &self,
-        repository: &GithubRepository,
-        kind: PullRequestListKind,
-    ) -> Result<PullRequestList, GithubError> {
-        let query = format!(
-            "query($searchQuery: String!) {{ search(type: ISSUE, query: $searchQuery, first: 50) {{ \
-             issueCount nodes {{ ... on PullRequest {{ {SUMMARY_FIELDS} }} }} }} }}"
-        );
-        let search_query = format!(
-            "repo:{} is:pr {}",
-            repository.full_name(),
-            kind.search_qualifiers()
-        );
-        let response: SearchResponse = self
-            .graphql(&query, vec![("searchQuery", Variable::text(search_query))])
-            .await?;
-        Ok(PullRequestList {
-            total_count: response.search.issue_count,
-            pull_requests: response.search.nodes,
-        })
     }
 
     pub async fn fetch_overview(
@@ -446,24 +358,6 @@ impl GithubClient {
             GithubError::InvalidResponse(format!("pull request #{number} not found"))
         })?;
         Ok(raw.into_overview())
-    }
-
-    pub async fn fetch_files(
-        &self,
-        repository: &GithubRepository,
-        number: u64,
-    ) -> Result<Vec<PullRequestFile>, GithubError> {
-        let query = "query($owner: String!, $name: String!, $number: Int!) { \
-            repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
-            files(first: 100) { nodes { path additions deletions changeType viewerViewedState } } \
-            } } }";
-        let response: FilesResponse = self
-            .graphql(query, repository_variables(repository, number))
-            .await?;
-        let pull_request = response.repository.pull_request.ok_or_else(|| {
-            GithubError::InvalidResponse(format!("pull request #{number} not found"))
-        })?;
-        Ok(pull_request.files.nodes)
     }
 
     pub async fn fetch_review_threads(
@@ -635,33 +529,6 @@ impl GithubClient {
             .map(drop)
     }
 
-    pub async fn set_file_viewed(
-        &self,
-        pull_request_id: &str,
-        path: &str,
-        viewed: bool,
-    ) -> Result<(), GithubError> {
-        let mutation = if viewed {
-            "markFileAsViewed"
-        } else {
-            "unmarkFileAsViewed"
-        };
-        let query = format!(
-            "mutation($pullRequestId: ID!, $path: String!) {{ \
-             {mutation}(input: {{ pullRequestId: $pullRequestId, path: $path }}) {{ \
-             clientMutationId }} }}"
-        );
-        self.graphql::<serde_json::Value>(
-            &query,
-            vec![
-                ("pullRequestId", Variable::text(pull_request_id)),
-                ("path", Variable::text(path)),
-            ],
-        )
-        .await
-        .map(drop)
-    }
-
     async fn graphql<T: DeserializeOwned>(
         &self,
         query: &str,
@@ -748,10 +615,24 @@ async fn spawn_gh(
     Err(GithubError::GhNotInstalled)
 }
 
+fn parse_branch_pull_request(
+    output: Result<String, GithubError>,
+) -> Result<Option<BranchPullRequest>, GithubError> {
+    match output {
+        Ok(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|error| GithubError::InvalidResponse(error.to_string())),
+        Err(GithubError::NoPullRequest) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn classify_failure(stderr: &str) -> GithubError {
     let message = stderr.trim().to_string();
     if message.contains("gh auth login") || message.contains("GH_TOKEN") {
         GithubError::NotAuthenticated(String::new())
+    } else if message.contains("no pull requests found") {
+        GithubError::NoPullRequest
     } else {
         GithubError::CommandFailed(message)
     }
@@ -797,27 +678,9 @@ struct PullRequestEnvelope<T> {
     pull_request: Option<T>,
 }
 
-#[derive(Deserialize)]
-struct SearchResponse {
-    search: SearchResults,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchResults {
-    issue_count: u64,
-    nodes: Vec<PullRequestSummary>,
-}
-
-type FilesResponse = RepositoryEnvelope<FilesNode>;
 type ThreadsResponse = RepositoryEnvelope<ThreadsNode>;
 type PendingReviewsResponse = RepositoryEnvelope<ReviewsNode>;
 type OverviewResponse = RepositoryEnvelope<RawOverview>;
-
-#[derive(Deserialize)]
-struct FilesNode {
-    files: Connection<PullRequestFile>,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -966,25 +829,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_search_results() {
-        let json = r#"{"data":{"search":{"issueCount":2,"nodes":[
-            {"id":"PR_1","number":12,"title":"Add widget","url":"https://github.com/o/r/pull/12",
-             "isDraft":true,"headRefName":"widget","baseRefName":"main",
-             "author":{"login":"octocat","avatarUrl":"https://example.com/a.png"}},
-            {"id":"PR_2","number":13,"title":"Fix bug","url":"https://github.com/o/r/pull/13",
-             "isDraft":false,"headRefName":"fix","baseRefName":"main","author":null}]}}}"#;
-        let response: SearchResponse = parse_graphql_response(json).unwrap();
-        assert_eq!(response.search.issue_count, 2);
-        assert_eq!(response.search.nodes[0].number, 12);
-        assert!(response.search.nodes[0].is_draft);
+    fn parses_current_branch_pull_request() {
+        let found = parse_branch_pull_request(Ok(
+            r#"{"number":12,"url":"https://github.com/octo-org/widgets/pull/12","state":"OPEN"}"#
+                .into(),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.number, 12);
+        assert_eq!(found.state, PullRequestState::Open);
         assert_eq!(
-            response.search.nodes[0]
-                .author
-                .as_ref()
-                .map(|author| author.login.as_str()),
-            Some("octocat")
+            found.repository(),
+            Some(GithubRepository {
+                owner: "octo-org".into(),
+                name: "widgets".into()
+            })
         );
-        assert_eq!(response.search.nodes[1].author, None);
+
+        let missing = classify_failure("no pull requests found for branch \"feature\"");
+        assert_eq!(parse_branch_pull_request(Err(missing)), Ok(None));
+        assert_eq!(
+            parse_branch_pull_request(Err(GithubError::GhNotInstalled)),
+            Err(GithubError::GhNotInstalled)
+        );
     }
 
     #[test]
@@ -1014,19 +881,6 @@ mod tests {
         assert_eq!(overview.check_state.as_deref(), Some("SUCCESS"));
         assert_eq!(overview.labels[0].name, "bug");
         assert_eq!(overview.timeline.len(), 2);
-    }
-
-    #[test]
-    fn parses_files_with_unknown_enum_values() {
-        let json = r#"{"data":{"repository":{"pullRequest":{"files":{"nodes":[
-            {"path":"src/a.rs","additions":3,"deletions":1,"changeType":"MODIFIED","viewerViewedState":"VIEWED"},
-            {"path":"src/b.rs","additions":9,"deletions":0,"changeType":"ADDED","viewerViewedState":"UNVIEWED"},
-            {"path":"src/c.rs","additions":0,"deletions":4,"changeType":"FUTURE_KIND","viewerViewedState":"DISMISSED"}]}}}}}"#;
-        let response: FilesResponse = parse_graphql_response(json).unwrap();
-        let files = response.repository.pull_request.unwrap().files.nodes;
-        assert_eq!(files[0].viewer_viewed_state, ViewedState::Viewed);
-        assert_eq!(files[1].change_type.letter(), "A");
-        assert_eq!(files[2].change_type, FileChangeType::Unknown);
     }
 
     #[test]

@@ -2446,7 +2446,7 @@ fn merge_results(results: Vec<TestResult>) -> TestResult {
         .unwrap_or(TestResult::Passed)
 }
 
-/// Visual tests for the native GitHub pull request panel, overview tab, inline
+/// Visual tests for the native GitHub pull request overview tab, inline
 /// review threads and the gutter comment overlay, all rendered from fixtures.
 #[cfg(target_os = "macos")]
 fn run_pull_request_visual_tests(
@@ -2456,13 +2456,10 @@ fn run_pull_request_visual_tests(
 ) -> Result<TestResult> {
     use git_ui::pull_requests::{
         github_api::{
-            Actor, DiffSide, FileChangeType, GithubContext, GithubRepository, Label, LatestReview,
-            PullRequestFile, PullRequestList, PullRequestListKind, PullRequestOverview,
-            PullRequestState, PullRequestSummary, ReviewComment, ReviewThread, TimelineItem,
-            ViewedState,
+            Actor, DiffSide, GithubContext, GithubRepository, Label, LatestReview,
+            PullRequestOverview, PullRequestState, ReviewComment, ReviewThread, TimelineItem,
         },
         pr_overview::PullRequestOverviewView,
-        pr_panel::PullRequestPanel,
         pr_review::open_review_with_fixture,
     };
 
@@ -2480,120 +2477,11 @@ fn run_pull_request_visual_tests(
             avatar_url: None,
         })
     };
-    let summary = |number: u64, title: &str, author: &str, is_draft: bool, head: &str| {
-        PullRequestSummary {
-            id: format!("PR_{number}"),
-            number,
-            title: title.into(),
-            url: format!("https://github.com/octo-org/widgets/pull/{number}"),
-            is_draft,
-            author: actor(author),
-            head_ref_name: head.into(),
-            base_ref_name: "main".into(),
-        }
-    };
-    let list = |pull_requests: Vec<PullRequestSummary>| PullRequestList {
-        total_count: pull_requests.len() as u64,
-        pull_requests,
-    };
     let created_at = "2026-10-06T09:30:00Z";
 
     let mut results = Vec::new();
     let large = size(px(1100.0), px(720.0));
     let tall = size(px(1100.0), px(1000.0));
-
-    // pr_panel
-    let retry = summary(
-        412,
-        "Retry failed requests with exponential backoff",
-        "octocat",
-        false,
-        "octocat/retry-logic",
-    );
-    let window = open_pull_request_fixture_window(&app_state, cx, &project_path, large)?;
-    let files = vec![
-        PullRequestFile {
-            path: "src/client/lib.rs".into(),
-            additions: 24,
-            deletions: 3,
-            change_type: FileChangeType::Modified,
-            viewer_viewed_state: ViewedState::Viewed,
-        },
-        PullRequestFile {
-            path: "src/client/backoff.rs".into(),
-            additions: 41,
-            deletions: 0,
-            change_type: FileChangeType::Added,
-            viewer_viewed_state: ViewedState::Unviewed,
-        },
-        PullRequestFile {
-            path: "src/legacy_retry.rs".into(),
-            additions: 0,
-            deletions: 57,
-            change_type: FileChangeType::Deleted,
-            viewer_viewed_state: ViewedState::Unviewed,
-        },
-    ];
-    window.update(cx, |workspace, window, cx| {
-        let lists = vec![
-            (
-                PullRequestListKind::WaitingForMyReview,
-                list(vec![
-                    retry.clone(),
-                    summary(
-                        409,
-                        "Add pagination to the widget list endpoint",
-                        "reviewer-a",
-                        false,
-                        "reviewer-a/pagination",
-                    ),
-                ]),
-            ),
-            (
-                PullRequestListKind::CreatedByMe,
-                list(vec![summary(
-                    415,
-                    "Draft: rework the connection pool",
-                    "me",
-                    true,
-                    "me/pool",
-                )]),
-            ),
-            (
-                PullRequestListKind::AllOpen,
-                list(vec![
-                    retry.clone(),
-                    summary(
-                        409,
-                        "Add pagination to the widget list endpoint",
-                        "reviewer-a",
-                        false,
-                        "reviewer-a/pagination",
-                    ),
-                    summary(
-                        401,
-                        "Bump serde to the latest minor release",
-                        "dependabot-bot",
-                        false,
-                        "deps/serde",
-                    ),
-                ]),
-            ),
-        ];
-        let panel = PullRequestPanel::new_with_fixture(
-            workspace,
-            lists,
-            vec![(retry.clone(), files)],
-            window,
-            cx,
-        );
-        workspace.add_panel(panel, window, cx);
-        workspace.open_panel::<PullRequestPanel>(window, cx);
-    })?;
-    settle(cx, window)?;
-    results.push(run_visual_test("pr_panel", window.into(), cx, update_baseline)?);
-    cx.update_window(window.into(), |_, window, _cx| window.remove_window())
-        .log_err();
 
     // pr_overview
     let window = open_pull_request_fixture_window(&app_state, cx, &project_path, tall)?;
