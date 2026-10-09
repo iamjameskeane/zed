@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Build this fork as a release "Zed Dev.app", install it into /Applications
+# and point the `zed` CLI in ~/.local/bin at it.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+lock_terminal="${LOCK_TERMINAL:-install-fork-$$}"
+~/LOCKS/lockctl acquire zed-build --terminal "$lock_terminal" --purpose "release bundle of zed fork" --queue
+trap '~/LOCKS/lockctl release zed-build --terminal "$lock_terminal"' EXIT
+
+source ~/.cargo/env
+# Command Line Tools stand in for Xcode until its license is accepted;
+# runtime_shaders avoids the Metal compiler that only ships with Xcode.
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
+export ZED_BUNDLE_FEATURES="gpui_platform/runtime_shaders"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
+
+script/bundle-mac -i
+
+app_path="/Applications/Zed Dev.app"
+mkdir -p "$HOME/.local/bin"
+ln -sf "$app_path/Contents/MacOS/cli" "$HOME/.local/bin/zed"
+echo "Installed $app_path ($(git rev-parse --short HEAD)); \`zed\` now opens it."
