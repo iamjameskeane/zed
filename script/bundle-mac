@@ -5,7 +5,7 @@ source script/lib/blob-store.sh
 
 build_flag="--release"
 zed_features="${ZED_BUNDLE_FEATURES:+--features ${ZED_BUNDLE_FEATURES}}"
-remote_server_features=""
+remote_server_features="${ZED_BUNDLE_FEATURES:+--features ${ZED_BUNDLE_FEATURES}}"
 target_dir="release"
 open_result=false
 local_install=false
@@ -37,7 +37,7 @@ do
             export CARGO_INCREMENTAL=true
             build_flag="";
             zed_features="--features util/debug-embed${ZED_BUNDLE_FEATURES:+,${ZED_BUNDLE_FEATURES}}"
-            remote_server_features="--features debug-embed"
+            remote_server_features="--features debug-embed${ZED_BUNDLE_FEATURES:+,${ZED_BUNDLE_FEATURES}}"
             target_dir="debug"
             ;;
         i) local_install=true;;
