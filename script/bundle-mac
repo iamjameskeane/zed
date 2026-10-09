@@ -4,7 +4,7 @@ set -euo pipefail
 source script/lib/blob-store.sh
 
 build_flag="--release"
-zed_features=""
+zed_features="${ZED_BUNDLE_FEATURES:+--features ${ZED_BUNDLE_FEATURES}}"
 remote_server_features=""
 target_dir="release"
 open_result=false
