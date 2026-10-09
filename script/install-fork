@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Build this fork as a release "Zed Dev.app", install it into /Applications
-# and point the `zed` CLI in ~/.local/bin at it.
+# Build this fork as "Zed Dev.app", install it into /Applications and point
+# the `zed` CLI in ~/.local/bin at it. Debug build by default (fast,
+# incremental); pass --release for an optimized build.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+bundle_flags=(-d -i)
+if [[ "${1:-}" == "--release" ]]; then
+    bundle_flags=(-i)
+fi
 
 lock_terminal="${LOCK_TERMINAL:-install-fork-$$}"
 ~/LOCKS/lockctl acquire zed-build --terminal "$lock_terminal" --purpose "release bundle of zed fork" --queue
@@ -17,7 +23,7 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
 export ZED_BUNDLE_FEATURES="gpui_platform/runtime_shaders"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-6}"
 
-script/bundle-mac -i
+script/bundle-mac "${bundle_flags[@]}"
 
 app_path="/Applications/Zed Dev.app"
 mkdir -p "$HOME/.local/bin"

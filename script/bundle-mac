@@ -36,7 +36,7 @@ do
         d)
             export CARGO_INCREMENTAL=true
             build_flag="";
-            zed_features="--features util/debug-embed"
+            zed_features="--features util/debug-embed${ZED_BUNDLE_FEATURES:+,${ZED_BUNDLE_FEATURES}}"
             remote_server_features="--features debug-embed"
             target_dir="debug"
             ;;
