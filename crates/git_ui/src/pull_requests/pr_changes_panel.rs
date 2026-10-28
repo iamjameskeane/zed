@@ -2,26 +2,28 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use collections::{HashMap, HashSet};
+use git::repository::RepoPath;
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, Task, WeakEntity, Window, px, uniform_list,
+    App, AsyncWindowContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    SharedString, Subscription, Task, WeakEntity, Window, px, uniform_list,
 };
 use ui::{Chip, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotifyTaskExt as _,
 };
+
+use crate::solo_diff_view::SoloDiffView;
 
 use super::TogglePullRequestPanel;
 use super::github_api::{
-    FileChangeType, GithubClient, GithubContext, GithubError,
-    PullRequestOverview, PullRequestFile, ReviewThread,
+    FileChangeType, GithubClient, GithubContext, GithubError, PullRequestFile, PullRequestOverview,
+    ReviewThread,
 };
 use super::pr_ask_ai::{ai_enabled, ask_ai_about_pull_request};
-use super::pr_overview::{
-    PullRequestOverviewView, open_pull_request_changes_at, state_badge,
-};
+use super::pr_overview::{PullRequestOverviewView, open_pull_request_changes_at, state_badge};
 use super::pr_status::{BranchLookup, BranchPullRequestLookup};
 
 const PULL_REQUEST_CHANGES_PANEL_KEY: &str = "PullRequestChangesPanel";
@@ -439,7 +441,13 @@ impl PullRequestChangesPanel {
         );
     }
 
-    fn open_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_file(
+        &mut self,
+        index: usize,
+        show_diff: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Content::Loaded(loaded) = &self.content else {
             return;
         };
@@ -449,14 +457,46 @@ impl PullRequestChangesPanel {
         let path = file.path.clone();
         let context = loaded.context.clone();
         let number = loaded.overview.number;
-        self.workspace
-            .update(cx, |workspace, cx| {
-                open_pull_request_changes_at(workspace, context, number, Some(path), window, cx);
-            })
-            .log_err();
+        let base_ref: SharedString = format!("origin/{}", loaded.overview.base_ref_name).into();
+        let show_diff = show_diff || file.change_type == FileChangeType::Deleted;
+        if show_diff {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    open_pull_request_changes_at(
+                        workspace,
+                        context,
+                        number,
+                        Some(path),
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+            return;
+        }
+
+        let Some(repository) = self.project.read(cx).active_repository(cx) else {
+            return;
+        };
+        let Some(repo_path) = RepoPath::new(&path).log_err() else {
+            return;
+        };
+        SoloDiffView::open_or_focus_since_ref(
+            repo_path,
+            base_ref,
+            repository,
+            self.workspace.clone(),
+            window,
+            cx,
+        )
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
     }
 
-    fn render_header(&self, loaded: &LoadedPullRequest, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        loaded: &LoadedPullRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let overview = &loaded.overview;
         let (state_label, state_color) = state_badge(overview);
         let title = SharedString::from(overview.title.clone());
@@ -518,9 +558,11 @@ impl PullRequestChangesPanel {
                             .style(ButtonStyle::Filled)
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::FileTextOutlined).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_description(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_description(window, cx)
+                                }),
+                            ),
                     )
                     .when(ai_enabled(cx), |this| {
                         this.child(
@@ -528,9 +570,9 @@ impl PullRequestChangesPanel {
                                 .style(ButtonStyle::Filled)
                                 .label_size(LabelSize::Small)
                                 .start_icon(Icon::new(IconName::ZedAssistant).size(IconSize::Small))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.ask_ai(window, cx)
-                                })),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.ask_ai(window, cx)),
+                                ),
                         )
                     })
                     .child(div().flex_1())
@@ -611,8 +653,8 @@ impl PullRequestChangesPanel {
                     let comment_count = loaded.thread_counts.get(&file.path).copied();
                     ListItem::new(("pull-request-file", row_index))
                         .indent_level(*depth)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_file(file_index, window, cx)
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            this.open_file(file_index, event.modifiers().alt, window, cx)
                         }))
                         .tooltip(Tooltip::text(file.path.clone()))
                         .child(

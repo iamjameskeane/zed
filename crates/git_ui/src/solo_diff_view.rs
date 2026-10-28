@@ -9,7 +9,8 @@ use editor::{
 };
 use git::{
     Commit, Restore, StageAndNext, StageFile, ToggleStaged, UnstageAndNext, UnstageFile,
-    repository::RepoPath, status::StageStatus,
+    repository::RepoPath,
+    status::{DiffTreeType, StageStatus, TreeDiffStatus},
 };
 use gpui::{
     Action, App, AppContext as _, Context, Empty, Entity, EventEmitter, FocusHandle, Focusable,
@@ -41,6 +42,9 @@ pub struct SoloDiffView {
     repository: Entity<Repository>,
     repository_id: RepositoryId,
     repo_path: RepoPath,
+    /// Set when the diff is against a branch merge base rather than HEAD.
+    /// Hunks then hold committed work, so staging controls do not apply.
+    base_ref: Option<SharedString>,
     buffer: Entity<Buffer>,
     diff: Entity<buffer_diff::BufferDiff>,
     editor: Entity<SplittableEditor>,
@@ -57,6 +61,30 @@ impl SoloDiffView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
+        Self::open_or_focus_against(entry.repo_path, None, repository, workspace, window, cx)
+    }
+
+    /// Opens the whole file with its changes since the merge base of `base_ref`
+    /// and HEAD, including uncommitted work.
+    pub fn open_or_focus_since_ref(
+        repo_path: RepoPath,
+        base_ref: SharedString,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        Self::open_or_focus_against(repo_path, Some(base_ref), repository, workspace, window, cx)
+    }
+
+    fn open_or_focus_against(
+        repo_path: RepoPath,
+        base_ref: Option<SharedString>,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
         let Some(workspace_entity) = workspace.upgrade() else {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
@@ -64,7 +92,10 @@ impl SoloDiffView {
         let existing = workspace_entity
             .read(cx)
             .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
+            .find(|item| {
+                item.read(cx)
+                    .matches(&repository, &repo_path, base_ref.as_ref(), cx)
+            });
         if let Some(existing) = existing {
             workspace_entity.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
@@ -75,27 +106,69 @@ impl SoloDiffView {
 
         let Some(project_path) = repository
             .read(cx)
-            .repo_path_to_project_path(&entry.repo_path, cx)
+            .repo_path_to_project_path(&repo_path, cx)
         else {
             return Task::ready(Err(anyhow::anyhow!(
                 "could not resolve repository path {:?}",
-                entry.repo_path
+                repo_path
             )));
         };
 
         let project = workspace_entity.read(cx).project().clone();
-        let repo_path = entry.repo_path;
         window.spawn(cx, async move |cx| {
             let buffer = project
                 .update(cx, |project, cx| {
                     project.open_buffer(project_path.clone(), cx)
                 })
                 .await?;
-            let diff = project
-                .update(cx, |project, cx| {
-                    project.open_uncommitted_diff(buffer.clone(), cx)
-                })
-                .await?;
+            let diff = match &base_ref {
+                None => {
+                    project
+                        .update(cx, |project, cx| {
+                            project.open_uncommitted_diff(buffer.clone(), cx)
+                        })
+                        .await?
+                }
+                Some(base_ref) => {
+                    let tree_diff = repository
+                        .update(cx, |repository, cx| {
+                            repository.diff_tree(
+                                DiffTreeType::MergeBaseWithWorktree {
+                                    base: base_ref.clone(),
+                                },
+                                cx,
+                            )
+                        })
+                        .await??;
+                    let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+                    match tree_diff.entries.get(&repo_path) {
+                        Some(status) => {
+                            let oid = match status {
+                                TreeDiffStatus::Added => None,
+                                TreeDiffStatus::Modified { old }
+                                | TreeDiffStatus::Deleted { old } => Some(*old),
+                            };
+                            git_store
+                                .update(cx, |git_store, cx| {
+                                    git_store.open_diff_since(
+                                        oid,
+                                        buffer.clone(),
+                                        repository.clone(),
+                                        cx,
+                                    )
+                                })
+                                .await?
+                        }
+                        None => {
+                            git_store
+                                .update(cx, |git_store, cx| {
+                                    git_store.open_uncommitted_diff(buffer.clone(), cx)
+                                })
+                                .await?
+                        }
+                    }
+                }
+            };
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
                 let workspace_handle = cx.entity();
@@ -104,6 +177,7 @@ impl SoloDiffView {
                         project,
                         repository,
                         repo_path,
+                        base_ref,
                         buffer,
                         diff,
                         workspace_handle,
@@ -122,6 +196,7 @@ impl SoloDiffView {
         project: Entity<Project>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        base_ref: Option<SharedString>,
         buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         workspace: Entity<Workspace>,
@@ -129,7 +204,8 @@ impl SoloDiffView {
         cx: &mut Context<Self>,
     ) -> Self {
         let repository_id = repository.read(cx).id;
-        let showing_full_file = EditorSettings::get_global(cx).file_diff.show_full_file;
+        let showing_full_file =
+            base_ref.is_some() || EditorSettings::get_global(cx).file_diff.show_full_file;
         let multibuffer = cx
             .new(|cx| Self::build_multibuffer(buffer.clone(), diff.clone(), showing_full_file, cx));
         let editor = cx.new(|cx| {
@@ -176,6 +252,7 @@ impl SoloDiffView {
             repository,
             repository_id,
             repo_path,
+            base_ref,
             buffer,
             diff,
             editor,
@@ -261,8 +338,16 @@ impl SoloDiffView {
         cx.notify();
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
-        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
+    fn matches(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        base_ref: Option<&SharedString>,
+        cx: &App,
+    ) -> bool {
+        self.repository_id == repository.read(cx).id
+            && &self.repo_path == repo_path
+            && self.base_ref.as_ref() == base_ref
     }
 
     fn button_states(&self, cx: &App) -> SoloDiffButtonStates {
@@ -695,6 +780,7 @@ impl ToolbarItemView for SoloDiffGitToolbar {
     ) -> ToolbarItemLocation {
         self.solo_diff = active_pane_item
             .and_then(|item| item.act_as::<SoloDiffView>(cx))
+            .filter(|entity| entity.read(cx).base_ref.is_none())
             .map(|entity| entity.downgrade());
         if self.solo_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
