@@ -3,10 +3,11 @@ use std::ops::Range;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Subscription, Task, WeakEntity, Window, px, uniform_list,
+    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy,
+    SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, px,
+    uniform_list,
 };
-use ui::{Chip, ListItem, Tooltip, prelude::*};
+use ui::{Chip, Disclosure, ListItem, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -15,16 +16,16 @@ use workspace::{
 
 use super::TogglePullRequestPanel;
 use super::github_api::{
-    FileChangeType, GithubClient, GithubContext, GithubError,
-    PullRequestOverview, PullRequestFile, ReviewThread,
+    FileChangeType, GithubClient, GithubContext, GithubError, GithubRepository, PullRequestFile,
+    PullRequestOverview, ReviewThread,
 };
 use super::pr_ask_ai::{ai_enabled, ask_ai_about_pull_request};
-use super::pr_overview::{
-    PullRequestOverviewView, open_pull_request_changes_at, state_badge,
-};
+use super::pr_overview::{PullRequestOverviewView, open_pull_request_changes_at, state_badge};
 use super::pr_status::{BranchLookup, BranchPullRequestLookup};
 
 const PULL_REQUEST_CHANGES_PANEL_KEY: &str = "PullRequestChangesPanel";
+
+actions!(pull_requests, [CollapseSelectedEntry, ExpandSelectedEntry]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TreeNode {
@@ -201,8 +202,10 @@ pub struct PullRequestChangesPanel {
     position: DockPosition,
     content: Content,
     loaded_for: Option<(super::github_api::GithubRepository, u64)>,
-    collapsed_directories: HashSet<String>,
+    collapsed_directories: HashMap<(GithubRepository, u64), HashSet<String>>,
     visible_rows: Vec<VisibleRow>,
+    selected_row: Option<usize>,
+    scroll_handle: UniformListScrollHandle,
     load_task: Task<()>,
     _subscription: Subscription,
 }
@@ -237,8 +240,10 @@ impl PullRequestChangesPanel {
                 position: DockPosition::Left,
                 content: Content::Loading,
                 loaded_for: None,
-                collapsed_directories: HashSet::default(),
+                collapsed_directories: HashMap::default(),
                 visible_rows: Vec::new(),
+                selected_row: None,
+                scroll_handle: UniformListScrollHandle::new(),
                 load_task: Task::ready(()),
                 _subscription: subscription,
             };
@@ -382,8 +387,8 @@ impl PullRequestChangesPanel {
     }
 
     fn set_loaded(&mut self, loaded: LoadedPullRequest, cx: &mut Context<Self>) {
-        self.collapsed_directories.clear();
         self.content = Content::Loaded(Box::new(loaded));
+        self.selected_row = None;
         self.rebuild_rows();
         cx.notify();
     }
@@ -391,21 +396,135 @@ impl PullRequestChangesPanel {
     fn rebuild_rows(&mut self) {
         self.visible_rows.clear();
         if let Content::Loaded(loaded) = &self.content {
-            flatten_tree(
-                &loaded.tree,
-                &self.collapsed_directories,
-                0,
-                &mut self.visible_rows,
-            );
+            let collapsed = self
+                .collapsed_directories
+                .entry((loaded.context.repository.clone(), loaded.overview.number))
+                .or_default();
+            flatten_tree(&loaded.tree, collapsed, 0, &mut self.visible_rows);
         }
+        self.selected_row = self
+            .visible_rows
+            .len()
+            .checked_sub(1)
+            .map(|last| self.selected_row.unwrap_or(0).min(last));
     }
 
     fn toggle_directory(&mut self, path: &str, cx: &mut Context<Self>) {
-        if !self.collapsed_directories.remove(path) {
-            self.collapsed_directories.insert(path.to_string());
+        let Content::Loaded(loaded) = &self.content else {
+            return;
+        };
+        let collapsed = self
+            .collapsed_directories
+            .entry((loaded.context.repository.clone(), loaded.overview.number))
+            .or_default();
+        if !collapsed.remove(path) {
+            collapsed.insert(path.to_string());
         }
+        self.selected_row = self.visible_rows.iter().position(
+            |row| matches!(row, VisibleRow::Directory { path: row_path, .. } if row_path == path),
+        );
         self.rebuild_rows();
+        self.scroll_to_selection();
         cx.notify();
+    }
+
+    fn scroll_to_selection(&self) {
+        if let Some(index) = self.selected_row {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Top);
+        }
+    }
+
+    fn select_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.visible_rows.get(index).is_none() {
+            return;
+        }
+        self.selected_row = Some(index);
+        self.scroll_to_selection();
+        cx.notify();
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_row(self.selected_row.map_or(0, |index| index + 1), cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_row(self.selected_row.unwrap_or(0).saturating_sub(1), cx);
+    }
+
+    fn collapse_selected_entry(
+        &mut self,
+        _: &CollapseSelectedEntry,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected) = self.selected_row else {
+            return;
+        };
+        let Some(row) = self.visible_rows.get(selected) else {
+            return;
+        };
+        let depth = match row {
+            VisibleRow::Directory { depth, .. } | VisibleRow::File { depth, .. } => *depth,
+        };
+        let path = self
+            .visible_rows
+            .iter()
+            .enumerate()
+            .take(selected + 1)
+            .rev()
+            .find_map(|(index, row)| match row {
+                VisibleRow::Directory {
+                    path,
+                    depth: directory_depth,
+                    collapsed: false,
+                    ..
+                } if index == selected || *directory_depth < depth => Some(path.clone()),
+                _ => None,
+            });
+        if let Some(path) = path {
+            self.toggle_directory(&path, cx);
+        }
+    }
+
+    fn expand_selected_entry(
+        &mut self,
+        _: &ExpandSelectedEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .selected_row
+            .and_then(|index| self.visible_rows.get(index))
+        {
+            Some(VisibleRow::Directory {
+                path,
+                collapsed: true,
+                ..
+            }) => {
+                self.toggle_directory(&path.clone(), cx);
+            }
+            Some(VisibleRow::Directory { .. }) => self.select_next(&menu::SelectNext, window, cx),
+            _ => {}
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        match self
+            .selected_row
+            .and_then(|index| self.visible_rows.get(index))
+        {
+            Some(VisibleRow::Directory { path, .. }) => {
+                self.toggle_directory(&path.clone(), cx);
+            }
+            Some(VisibleRow::File { index, .. }) => self.open_file(*index, window, cx),
+            None => {}
+        }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -456,7 +575,11 @@ impl PullRequestChangesPanel {
             .log_err();
     }
 
-    fn render_header(&self, loaded: &LoadedPullRequest, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(
+        &self,
+        loaded: &LoadedPullRequest,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let overview = &loaded.overview;
         let (state_label, state_color) = state_badge(overview);
         let title = SharedString::from(overview.title.clone());
@@ -518,9 +641,11 @@ impl PullRequestChangesPanel {
                             .style(ButtonStyle::Filled)
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::FileTextOutlined).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_description(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_description(window, cx)
+                                }),
+                            ),
                     )
                     .when(ai_enabled(cx), |this| {
                         this.child(
@@ -528,9 +653,9 @@ impl PullRequestChangesPanel {
                                 .style(ButtonStyle::Filled)
                                 .label_size(LabelSize::Small)
                                 .start_icon(Icon::new(IconName::ZedAssistant).size(IconSize::Small))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.ask_ai(window, cx)
-                                })),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.ask_ai(window, cx)),
+                                ),
                         )
                     })
                     .child(div().flex_1())
@@ -579,22 +704,40 @@ impl PullRequestChangesPanel {
                     collapsed,
                 } => {
                     let toggle_path = path.clone();
+                    let disclosure_path = path.clone();
+                    let label_path = path.clone();
                     ListItem::new(("pull-request-directory", row_index))
                         .indent_level(*depth)
-                        .toggle(!*collapsed)
-                        .always_show_disclosure_icon(true)
-                        .on_toggle(cx.listener({
-                            let toggle_path = toggle_path.clone();
-                            move |this, _, _, cx| this.toggle_directory(&toggle_path, cx)
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .toggle_state(self.selected_row == Some(row_index))
+                        .start_slot(
+                            div()
+                                .debug_selector(move || format!("pr-directory-{disclosure_path}"))
+                                .child(
+                                    Disclosure::new("directory-disclosure", !*collapsed).on_click(
+                                        cx.listener({
+                                            let toggle_path = toggle_path.clone();
+                                            move |this, _, window, cx| {
+                                                window.focus(&this.focus_handle, cx);
+                                                this.toggle_directory(&toggle_path, cx);
+                                            }
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
                             this.toggle_directory(&toggle_path, cx)
                         }))
                         .child(
-                            Label::new(format!("{name}/"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
+                            div()
+                                .min_w_0()
+                                .debug_selector(move || format!("pr-directory-label-{label_path}"))
+                                .child(
+                                    Label::new(format!("{name}/"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
                         )
                         .into_any_element()
                 }
@@ -611,7 +754,11 @@ impl PullRequestChangesPanel {
                     let comment_count = loaded.thread_counts.get(&file.path).copied();
                     ListItem::new(("pull-request-file", row_index))
                         .indent_level(*depth)
+                        .toggle_state(self.selected_row == Some(row_index))
+                        .start_slot(div().w_4().flex_none())
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.select_row(row_index, cx);
                             this.open_file(file_index, window, cx)
                         }))
                         .tooltip(Tooltip::text(file.path.clone()))
@@ -693,6 +840,11 @@ impl Render for PullRequestChangesPanel {
             .id("pull-request-changes-panel")
             .key_context("PullRequestChangesPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::collapse_selected_entry))
+            .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::confirm))
             .size_full()
             .bg(cx.theme().colors().panel_background);
         match &self.content {
@@ -721,6 +873,7 @@ impl Render for PullRequestChangesPanel {
                                 self.visible_rows.len(),
                                 cx.processor(Self::render_rows),
                             )
+                            .track_scroll(&self.scroll_handle)
                             .flex_1()
                             .min_h_0(),
                         )
@@ -776,6 +929,154 @@ impl Panel for PullRequestChangesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded_fixture(repository_name: &str, number: u64) -> LoadedPullRequest {
+        LoadedPullRequest::new(
+            GithubContext {
+                repository: GithubRepository {
+                    owner: "octo-org".into(),
+                    name: repository_name.into(),
+                },
+                working_directory: "/project".into(),
+            },
+            PullRequestOverview {
+                id: format!("PR_{number}"),
+                number,
+                title: "Update tests".into(),
+                body: String::new(),
+                state: super::super::github_api::PullRequestState::Open,
+                is_draft: false,
+                url: format!("https://github.com/octo-org/{repository_name}/pull/{number}"),
+                author: None,
+                head_ref_name: "update-tests".into(),
+                base_ref_name: "main".into(),
+                head_ref_oid: String::new(),
+                base_ref_oid: String::new(),
+                review_requests: Vec::new(),
+                latest_reviews: Vec::new(),
+                labels: Vec::new(),
+                check_state: None,
+                timeline: Vec::new(),
+            },
+            Ok([
+                "tests/unit/first.rs",
+                "tests/unit/second.rs",
+                "tests/root.rs",
+                "README.md",
+            ]
+            .into_iter()
+            .map(|path| PullRequestFile {
+                path: path.into(),
+                additions: 1,
+                deletions: 0,
+                change_type: FileChangeType::Modified,
+            })
+            .collect()),
+            &[],
+        )
+    }
+
+    #[gpui::test]
+    async fn root_and_nested_folds_survive_refresh_and_are_scoped_to_each_pull_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+            let keymap = settings::KeymapFile::parse(include_str!(
+                "../../../../assets/keymaps/default-macos.json"
+            ))
+            .expect("default keymap parses");
+            let section = keymap
+                .sections()
+                .find(|section| section.context == "PullRequestChangesPanel")
+                .expect("PR panel has default keybindings");
+            let bindings: BTreeMap<_, _> = section
+                .bindings()
+                .map(|(keystrokes, action)| (keystrokes, action.to_string()))
+                .collect();
+            let keymap = serde_json::json!([{
+                "context": section.context,
+                "bindings": bindings,
+            }]);
+            let bindings = settings::KeymapFile::load_panic_on_failure(&keymap.to_string(), cx);
+            cx.bind_keys(bindings);
+        });
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/project", serde_json::json!({})).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let fixture = loaded_fixture("widgets", 1);
+            let panel = PullRequestChangesPanel::new_with_fixture(
+                workspace,
+                fixture.context,
+                fixture.overview,
+                fixture.files,
+                Vec::new(),
+                cx,
+            );
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<PullRequestChangesPanel>(window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        let root = cx
+            .debug_bounds("pr-directory-tests")
+            .expect("root disclosure is visible");
+        assert!(root.left() >= px(0.));
+        cx.simulate_click(root.center(), gpui::Modifiers::none());
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 2));
+
+        cx.simulate_keystrokes("right");
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 6));
+        let nested = cx
+            .debug_bounds("pr-directory-tests/unit")
+            .expect("nested disclosure is visible");
+        cx.simulate_click(nested.center(), gpui::Modifiers::none());
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 4));
+
+        cx.simulate_keystrokes("left");
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 2));
+        cx.simulate_keystrokes("right");
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 4));
+
+        cx.simulate_keystrokes("down enter");
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 6));
+        cx.simulate_keystrokes("left up");
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.visible_rows.len(), 4);
+            assert_eq!(panel.selected_row, Some(0));
+        });
+        let root_label = cx
+            .debug_bounds("pr-directory-label-tests")
+            .expect("root label is visible");
+        cx.simulate_click(root_label.center(), gpui::Modifiers::none());
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 2));
+        cx.simulate_click(root_label.center(), gpui::Modifiers::none());
+        panel.read_with(cx, |panel, _| assert_eq!(panel.visible_rows.len(), 4));
+
+        panel.update(cx, |panel, cx| {
+            panel.refresh(cx);
+            panel.set_loaded(loaded_fixture("widgets", 1), cx);
+            assert_eq!(panel.visible_rows.len(), 4);
+            panel.set_loaded(loaded_fixture("widgets", 2), cx);
+            assert_eq!(panel.visible_rows.len(), 6);
+            panel.set_loaded(loaded_fixture("other-widgets", 1), cx);
+            assert_eq!(panel.visible_rows.len(), 6);
+            panel.set_loaded(loaded_fixture("widgets", 1), cx);
+            assert_eq!(panel.visible_rows.len(), 4);
+        });
+    }
 
     fn directory(name: &str, path: &str, children: Vec<TreeNode>) -> TreeNode {
         TreeNode::Directory {

@@ -33,4 +33,21 @@ The main checkout's uncommitted patch changes how files open from the PR changes
 
 Pass: `cargo check -p git_ui -p agent_ui -j 6` on macOS arm64. The check includes the folder folding work that follows this sync.
 
-Pending: focused PR tests and one `script/install-fork` build.
+Pass: `cargo test -p git_ui pull_requests:: -j 6 -- --nocapture` (16 tests). The macOS linker emits a compact unwind table size warning; the tests pass.
+
+Pending: one `script/install-fork` build.
+
+## PR panel folders
+
+The folder disclosure is part of its row, so the root folder control stays inside the list. A click on the disclosure or folder label folds or expands that folder.
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Select a visible row |
+| Left | Fold the selected folder, or the nearest open parent |
+| Right | Expand the selected folder, or select its first child when already open |
+| Enter | Toggle a folder, or open the selected file |
+
+Fold state is held in the panel, keyed by repository and PR number. A refresh keeps that state. Switching PRs does not apply one PR's folds to another PR. Closing the panel entity drops the state.
+
+The GPUI regression test covers root and nested disclosure clicks, folder-label clicks, default arrow and Enter bindings, refresh, and isolation by repository and PR number.
