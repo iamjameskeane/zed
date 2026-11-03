@@ -1004,6 +1004,16 @@
     },
   },
   {
+    "context": "PullRequestChangesPanel",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "left": "pull_requests::CollapseSelectedEntry",
+      "right": "pull_requests::ExpandSelectedEntry",
+      "enter": "menu::Confirm",
+    },
+  },
+  {
     "context": "ProjectPanel",
     "bindings": {
       "left": "project_panel::CollapseSelectedEntry",

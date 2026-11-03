@@ -33,4 +33,23 @@ The main checkout's uncommitted patch changes how files open from the PR changes
 
 Pass: `cargo check -p git_ui -p agent_ui -j 6` on macOS arm64. The check includes the folder folding work that follows this sync.
 
-Pending: focused PR tests and one `script/install-fork` build.
+Pass: `cargo test -p git_ui pull_requests:: -j 6 -- --nocapture` (16 tests). The macOS linker emits a compact unwind table size warning; the tests pass.
+
+Pass: one full `script/install-fork` build from source commit `b5c8761144`. The app build took 5 minutes 29 seconds; the remote server build took 2 minutes 12 seconds. Installed `/Applications/Zed Dev.app` and pointed `~/.local/bin/zed` at its bundled CLI.
+
+GitHub CI skips this fork because `run_tests.yml` allows only the upstream owners. The local checks above are the validation for this sync. Native light/dark checks, Windows/Linux runtime checks, and live review submission remain unchecked.
+
+## PR panel folders
+
+The folder disclosure is part of its row, so the root folder control stays inside the list. A click on the disclosure or folder label folds or expands that folder.
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Select a visible row |
+| Left | Fold the selected folder, or the nearest open parent |
+| Right | Expand the selected folder, or select its first child when already open |
+| Enter | Toggle a folder, or open the selected file |
+
+Fold state is held in the panel, keyed by repository and PR number. A refresh keeps that state. Switching PRs does not apply one PR's folds to another PR. Closing the panel entity drops the state.
+
+The GPUI regression test covers root and nested disclosure clicks, folder-label clicks, default arrow and Enter bindings, refresh, and isolation by repository and PR number.
