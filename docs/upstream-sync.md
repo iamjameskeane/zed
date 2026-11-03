@@ -35,7 +35,9 @@ Pass: `cargo check -p git_ui -p agent_ui -j 6` on macOS arm64. The check include
 
 Pass: `cargo test -p git_ui pull_requests:: -j 6 -- --nocapture` (16 tests). The macOS linker emits a compact unwind table size warning; the tests pass.
 
-Pending: one `script/install-fork` build.
+Pass: one full `script/install-fork` build from source commit `b5c8761144`. The app build took 5 minutes 29 seconds; the remote server build took 2 minutes 12 seconds. Installed `/Applications/Zed Dev.app` and pointed `~/.local/bin/zed` at its bundled CLI.
+
+GitHub CI skips this fork because `run_tests.yml` allows only the upstream owners. The local checks above are the validation for this sync. Native light/dark checks, Windows/Linux runtime checks, and live review submission remain unchecked.
 
 ## PR panel folders
 
